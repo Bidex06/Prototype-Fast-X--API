@@ -555,7 +555,8 @@ public sealed class AutoTradeService : BackgroundService
             entryPrice: isSpot ? signal.Price : null,
             useFutures: bot.UseFutures,
             idempotencyKey: idempotencyKey,
-            botId: bot.Id);
+            botId: bot.Id,
+            connectionId: bot.BrokerConnectionId);
 
         cancellationToken.ThrowIfCancellationRequested();
 

@@ -1690,11 +1690,18 @@ namespace TradingBotEngine.Services
                             ? Bybit.Net.Enums.Category.Linear
                             : Bybit.Net.Enums.Category.Spot;
 
-                    // Bybit documents spot (and linear) TP/SL on create with an explicit
-                    // tpslMode. Without it, an order that carries stopLoss/takeProfit was
-                    // rejected on demo with 170003 "unknown parameter".
+                    // tpslMode ("Full"/"Partial") is a Linear/Inverse (derivatives)
+                    // parameter. Bybit Spot rejects it with 170003 "unknown parameter".
+                    // Bybit Futures attaches SL/TP on the entry via tpslMode=Full.
+                    // Bybit Spot cannot attach SL/TP on the entry without the full
+                    // tpslMode=Partial + slOrderType + tpOrderType + slLimitPrice +
+                    // tpLimitPrice bundle, which this library version does not expose.
+                    // Spot protection is placed as two separate orders by
+                    // TryEnsureProtectionAsync after the entry fills.
+                    var useAttachedProtection = useFutures;
+
                     Bybit.Net.Enums.StopLossTakeProfitMode? tpslMode = null;
-                    if (stopLoss.HasValue || takeProfit.HasValue)
+                    if (useAttachedProtection && (stopLoss.HasValue || takeProfit.HasValue))
                         tpslMode = Bybit.Net.Enums.StopLossTakeProfitMode.Full;
 
                     var result =
@@ -1717,9 +1724,9 @@ namespace TradingBotEngine.Services
                                 quantity: quantity,
                                 price: entryPrice,
                                 clientOrderId: clientOrderId,
-                                stopLoss: stopLoss,
-                                takeProfit: takeProfit,
-                                stopLossTakeProfitMode: tpslMode);
+                                stopLoss: useAttachedProtection ? stopLoss : null,
+                                takeProfit: useAttachedProtection ? takeProfit : null,
+                                stopLossTakeProfitMode: useAttachedProtection ? tpslMode : null);
 
                     if (!result.Success)
                     {
@@ -1789,8 +1796,10 @@ namespace TradingBotEngine.Services
                     pendingTrade.UpdatedAt =
                         DateTime.UtcNow;
 
-                    if (stopLoss.HasValue || takeProfit.HasValue)
+                    if (useAttachedProtection && (stopLoss.HasValue || takeProfit.HasValue))
                         pendingTrade.ProtectionStatus = "ExchangeManaged";
+                    else if (stopLoss.HasValue || takeProfit.HasValue)
+                        pendingTrade.ProtectionStatus = "Pending";
 
                     await PersistExchangeOrderAsync(
                         userId,
@@ -2017,7 +2026,8 @@ namespace TradingBotEngine.Services
                     trade.UpdatedAt = DateTime.UtcNow;
 
                     if ((trade.StopLoss.HasValue || trade.TakeProfit.HasValue) &&
-                        trade.BrokerName.Equals("Bybit", StringComparison.OrdinalIgnoreCase))
+                        trade.BrokerName.Equals("Bybit", StringComparison.OrdinalIgnoreCase) &&
+                        foundFutures)
                     {
                         trade.ProtectionStatus = "ExchangeManaged";
                     }
@@ -2500,8 +2510,135 @@ namespace TradingBotEngine.Services
 
             if (connection.BrokerName.Equals("Bybit", StringComparison.OrdinalIgnoreCase))
             {
-                trade.ProtectionStatus = "ExchangeManaged";
+                var client = CreateClient(connection);
+                if (client is not BybitRestClient bybit)
+                    return false;
+
+                var parent = await _context.ExchangeOrders.FirstOrDefaultAsync(o =>
+                    o.TradeId == trade.Id &&
+                    o.ExchangeOrderId == entryExchangeOrderId &&
+                    o.OrderRole == "Entry");
+
+                if (parent == null)
+                    return false;
+
+                // Bybit Futures attached SL/TP on the entry order directly.
+                if (parent.IsFutures)
+                {
+                    trade.ProtectionStatus = "ExchangeManaged";
+                    trade.UpdatedAt = DateTime.UtcNow;
+                    await _context.SaveChangesAsync();
+                    return true;
+                }
+
+                // Bybit Spot: place a stop-market and a take-profit limit separately.
+                // Do not place protection until the entry has actually filled.
+                var filledQuantity = parent.FilledQuantity;
+                if (filledQuantity <= 0m)
+                {
+                    trade.ProtectionStatus = "Pending";
+                    trade.UpdatedAt = DateTime.UtcNow;
+                    await _context.SaveChangesAsync();
+                    return true;
+                }
+
+                // Bybit takes its trading fee from the base asset on spot buys, so the
+                // free balance is slightly BELOW the ordered quantity. Placing a
+                // protection order for the full filled quantity gets rejected with
+                // 170131 "Insufficient balance". Cap the protection at whatever free
+                // balance is actually available.
+                var freeBase = await GetSpotAssetBalanceAsync(
+                    ExtractBaseAsset(trade.Symbol),
+                    connection);
+
+                var protectQuantity = filledQuantity;
+
+                if (freeBase > 0m && freeBase < protectQuantity)
+                    protectQuantity = freeBase;
+
+                // Floor to 4 decimals. Bybit Spot ETHUSDT lot step is 0.01, so this
+                // is more than enough precision and avoids float-precision rejections.
+                protectQuantity = Math.Floor(protectQuantity * 10000m) / 10000m;
+
+                if (protectQuantity <= 0m)
+                {
+                    trade.ProtectionStatus = "ProtectionPending";
+                    trade.Reason = "Bybit Spot protection skipped: no sellable quantity after fees.";
+                    trade.UpdatedAt = DateTime.UtcNow;
+                    await _context.SaveChangesAsync();
+                    return false;
+                }
+
+                var protectionSide = entrySide.Equals("BUY", StringComparison.OrdinalIgnoreCase)
+                    ? Bybit.Net.Enums.OrderSide.Sell
+                    : Bybit.Net.Enums.OrderSide.Buy;
+
+                // Stop-loss: conditional market order triggered on last price.
+                if (trade.StopLoss.HasValue && string.IsNullOrWhiteSpace(trade.StopLossOrderId))
+                {
+                    var sl = await bybit.V5Api.Trading.PlaceOrderAsync(
+                        category: Bybit.Net.Enums.Category.Spot,
+                        symbol: trade.Symbol,
+                        side: protectionSide,
+                        type: Bybit.Net.Enums.NewOrderType.Market,
+                        quantity: protectQuantity,
+                        triggerPrice: trade.StopLoss.Value,
+                        triggerBy: Bybit.Net.Enums.TriggerType.LastPrice);
+
+                    if (!sl.Success || sl.Data == null)
+                    {
+                        trade.ProtectionStatus = "ProtectionPending";
+                        trade.Reason = LimitLength($"Bybit Spot stop-loss was not accepted: {sl.Error}", 480);
+                        trade.UpdatedAt = DateTime.UtcNow;
+                        await _context.SaveChangesAsync();
+                        return false;
+                    }
+
+                    trade.StopLossOrderId = sl.Data.OrderId;
+                    await PersistExchangeOrderAsync(
+                        trade.UserId, trade, connection, sl.Data.OrderId,
+                        protectionSide == Bybit.Net.Enums.OrderSide.Buy ? "BUY" : "SELL",
+                        "StopMarket", false, "StopLoss", parent.Id);
+                }
+
+                // Take-profit: limit order at the target price.
+                if (trade.TakeProfit.HasValue && string.IsNullOrWhiteSpace(trade.TakeProfitOrderId))
+                {
+                    var tp = await bybit.V5Api.Trading.PlaceOrderAsync(
+                        category: Bybit.Net.Enums.Category.Spot,
+                        symbol: trade.Symbol,
+                        side: protectionSide,
+                        type: Bybit.Net.Enums.NewOrderType.Limit,
+                        quantity: protectQuantity,
+                        price: trade.TakeProfit.Value);
+
+                    if (!tp.Success || tp.Data == null)
+                    {
+                        trade.ProtectionStatus = "ProtectionPending";
+                        trade.Reason = LimitLength($"Bybit Spot take-profit was not accepted: {tp.Error}", 480);
+                        trade.UpdatedAt = DateTime.UtcNow;
+                        await _context.SaveChangesAsync();
+                        return false;
+                    }
+
+                    trade.TakeProfitOrderId = tp.Data.OrderId;
+                    await PersistExchangeOrderAsync(
+                        trade.UserId, trade, connection, tp.Data.OrderId,
+                        protectionSide == Bybit.Net.Enums.OrderSide.Buy ? "BUY" : "SELL",
+                        "TakeProfit", false, "TakeProfit", parent.Id);
+                }
+
+                trade.ProtectionStatus = "Protected";
+                trade.Reason = null;
                 trade.UpdatedAt = DateTime.UtcNow;
+                _context.AuditLogs.Add(new AuditLog
+                {
+                    UserId = trade.UserId,
+                    Action = "ProtectionOrdersCreated",
+                    Details = $"Bybit Spot protection created for trade {trade.Id}. SL={trade.StopLossOrderId ?? "none"}, TP={trade.TakeProfitOrderId ?? "none"}.",
+                    CreatedAt = DateTime.UtcNow
+                });
+                await _context.SaveChangesAsync();
                 return true;
             }
 
@@ -3427,6 +3564,3 @@ namespace TradingBotEngine.Services
             };
     }
 }
-
-
-
