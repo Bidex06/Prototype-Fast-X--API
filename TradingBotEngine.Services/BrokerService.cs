@@ -11,11 +11,6 @@ using TradingBotEngine.Data.Models;
 
 namespace TradingBotEngine.Services
 {
-    /// <summary>
-    /// Creates exchange clients from encrypted, user-owned connection metadata on demand.
-    /// No exchange client is kept in a scoped in-memory dictionary, so API restarts do not
-    /// silently disconnect users from their persisted broker configuration.
-    /// </summary>
     public class BrokerService
     {
         private readonly ApplicationDbContext _context;
@@ -75,10 +70,6 @@ namespace TradingBotEngine.Services
                 _context.BrokerConnections.Add(persisted);
             }
 
-            // A connect/reconnect request is a fresh credential verification.
-            // Always replace the encrypted credentials, reactivate the record,
-            // and require a fresh live-trading opt-in. This prevents stale or
-            // previously approved live credentials from silently carrying over.
             persisted.ApiKey = _protector.Protect(apiKey);
             persisted.ApiSecret = _protector.Protect(apiSecret);
             persisted.IsActive = true;
@@ -265,8 +256,6 @@ namespace TradingBotEngine.Services
                     return false;
                 }
 
-                // Re-verify the same stored credentials against the live
-                // environment before switching the persisted connection.
                 var originalIsTestnet = connection.IsTestnet;
                 connection.IsTestnet = false;
 
@@ -458,8 +447,6 @@ namespace TradingBotEngine.Services
 
                 if (client is BybitRestClient bybit)
                 {
-                    // Every current Bybit account (including demo) is a Unified account. The old
-                    // Spot/Contract account types are rejected, and "Free" is empty on Unified.
                     var result =
                         await bybit.V5Api.Account
                             .GetBalancesAsync(
@@ -476,13 +463,12 @@ namespace TradingBotEngine.Services
                                 a.Asset == currency);
 
                         if (coin != null)
-                            return coin.Free ?? Math.Max(0m, coin.WalletBalance - (coin.Locked ?? 0m));
+                            return coin.WalletBalance; 
                     }
                 }
             }
             catch
             {
-                // Do not leak exchange exception details through the API.
             }
 
             return 0;
@@ -505,7 +491,6 @@ namespace TradingBotEngine.Services
             direction = direction?.Trim() ?? string.Empty;
             orderType = orderType?.Trim() ?? string.Empty;
 
-            // 4.8: caller does not provide quantity.
             if (string.IsNullOrWhiteSpace(symbol))
             {
                 return await AuditOrderFailureAsync(
@@ -604,10 +589,6 @@ namespace TradingBotEngine.Services
                     $"Order for '{symbol}' was blocked because explicit live-trading opt-in is not enabled.");
             }
 
-            // Spot SELL is a position-reducing action, not a short entry.
-            // Protective SL/TP belongs on the asset-holding side of a spot
-            // position, so a spot SELL with protection parameters is rejected
-            // rather than silently changing the meaning of the request.
             if (!useFutures &&
                 direction.Equals("SELL", StringComparison.OrdinalIgnoreCase) &&
                 (stopLoss.HasValue || takeProfit.HasValue))
@@ -630,10 +611,6 @@ namespace TradingBotEngine.Services
                     "Protected Bybit Spot orders must use a limit entry.",
                     $"Bybit Spot order for '{symbol}' was rejected because the protected Spot path uses a limit entry so TP/SL can be attached safely.");
             }
-
-            // ---------------------------------------------------------
-            // IDEMPOTENCY CHECK
-            // ---------------------------------------------------------
 
             var existingTrade =
                 await _context.Trades
@@ -664,10 +641,6 @@ namespace TradingBotEngine.Services
                     $"Duplicate order request blocked for idempotency key '{idempotencyKey}'.");
             }
 
-            // ---------------------------------------------------------
-            // SERVER-SIDE RISK SIZING
-            // ---------------------------------------------------------
-
             var riskSetting = await _context.RiskSettings
                 .AsNoTracking()
                 .FirstOrDefaultAsync(r => r.UserId == userId);
@@ -681,11 +654,6 @@ namespace TradingBotEngine.Services
                     $"Order for '{symbol}' was blocked because risk settings are not configured for user {userId}.");
             }
 
-            // ---------------------------------------------------------
-            // #8.4 EMERGENCY KILL SWITCH
-            // ---------------------------------------------------------
-            // Server-side trading circuit breaker. New orders must be
-            // blocked before any exchange-dependent execution occurs.
             if (riskSetting.IsEmergencyKillSwitch)
             {
                 _context.AuditLogs.Add(new AuditLog
@@ -716,13 +684,6 @@ namespace TradingBotEngine.Services
                     $"Order for '{symbol}' was blocked because RiskPerTrade ({riskSetting.RiskPerTrade:F2}%) is invalid.");
             }
 
-            // ---------------------------------------------------------
-            // #8.1 MAXIMUM OPEN TRADES
-            // ---------------------------------------------------------
-            // Count every trade that can still represent an open or
-            // unresolved exchange exposure. Pending and reconciliation
-            // states are included so a user cannot bypass the limit by
-            // submitting several requests before reconciliation runs.
             if (riskSetting.MaxOpenTrades <= 0)
             {
                 _context.AuditLogs.Add(new AuditLog
@@ -770,13 +731,6 @@ namespace TradingBotEngine.Services
                     $"Maximum open trades limit reached ({riskSetting.MaxOpenTrades}).");
             }
 
-            // ---------------------------------------------------------
-            // #8.2 DAILY-LOSS LIMIT
-            // ---------------------------------------------------------
-            // DailyLossLimit is configured as a percentage of the
-            // current account balance. Only realized losses from trades
-            // closed today are counted. The check happens before any
-            // exchange order submission.
             if (riskSetting.DailyLossLimit <= 0m ||
                 riskSetting.DailyLossLimit > 100m)
             {
@@ -848,11 +802,6 @@ namespace TradingBotEngine.Services
                     $"Daily loss limit reached ({dailyLossLimitAmount:F2} USDT).");
             }
 
-            // ---------------------------------------------------------
-            // #8.3 MAXIMUM DRAWDOWN
-            // ---------------------------------------------------------
-            // Track the user's peak account equity and block new orders
-            // once the configured percentage drawdown is reached.
             if (riskSetting.MaxDrawdown <= 0m ||
                 riskSetting.MaxDrawdown > 100m)
             {
@@ -894,8 +843,6 @@ namespace TradingBotEngine.Services
                     $"Order for '{symbol}' was blocked because current account equity could not be established.");
             }
 
-            // Reload the tracked RiskSetting so the high-water mark can
-            // be safely persisted.
             var trackedRiskSetting = await _context.RiskSettings
                 .FirstOrDefaultAsync(r => r.UserId == userId);
 
@@ -994,12 +941,6 @@ namespace TradingBotEngine.Services
             }
             else
             {
-                // A MARKET order still needs a real exchange price for
-                // server-side risk sizing. Do not use a parameterless
-                // ExchangeMarketDataService here because it does not know
-                // the persisted testnet/live environment of this user's
-                // broker connection. Query the same authenticated client
-                // created from that connection instead.
                 var pricingClient = CreateClient(connection);
 
                 if (pricingClient is BinanceRestClient pricingBinance)
@@ -1068,8 +1009,6 @@ namespace TradingBotEngine.Services
 
             if (stopLoss.HasValue && stopLoss.Value > 0m)
             {
-                // The stop must sit on the loss side of the entry, otherwise the
-                // "risk" being sized is meaningless (or the exchange fires it at once).
                 var isBuyOrder = direction.Equals("BUY", StringComparison.OrdinalIgnoreCase);
 
                 if ((isBuyOrder && stopLoss.Value >= sizingPrice) ||
@@ -1083,8 +1022,6 @@ namespace TradingBotEngine.Services
                         $"is not on the loss side of reference price {sizingPrice}.");
                 }
 
-                // Size so that being stopped out loses RiskPerTrade% of the balance:
-                //   quantity = (balance * risk%) / |entry - stop|, capped by leverage.
                 try
                 {
                     calculatedQuantity = OrderRiskSizer.CalculateQuantity(
@@ -1108,8 +1045,6 @@ namespace TradingBotEngine.Services
             }
             else
             {
-                // No stop-loss means the loss per trade is undefined, so risk-based sizing
-                // is impossible. Legacy fallback: RiskPerTrade% of balance as margin.
                 var riskCapital =
                     balance * (riskSetting.RiskPerTrade / 100m);
 
@@ -1119,10 +1054,6 @@ namespace TradingBotEngine.Services
                 calculatedQuantity =
                     targetNotional / sizingPrice;
             }
-
-            // ---------------------------------------------------------
-            // 4.9 FINAL QUANTITY VALIDATION
-            // ---------------------------------------------------------
 
             if (calculatedQuantity <= 0m)
             {
@@ -1142,8 +1073,6 @@ namespace TradingBotEngine.Services
                     $"Order for '{symbol}' was rejected because the exchange quantity step is invalid.");
             }
 
-            // Normalize DOWN only.
-            // Never round up because doing so could increase risk.
             calculatedQuantity =
                 Math.Floor(
                     calculatedQuantity / rules.QuantityStep)
@@ -1176,7 +1105,6 @@ namespace TradingBotEngine.Services
                     * rules.QuantityStep;
             }
 
-            // Re-check minimum after maximum normalization.
             if (calculatedQuantity < rules.MinQuantity)
             {
                 return await AuditOrderFailureAsync(
@@ -1208,7 +1136,6 @@ namespace TradingBotEngine.Services
                     $"Order for '{symbol}' was rejected because final order value is below the exchange minimum.");
             }
 
-            // Spot orders must never exceed the available quote balance.
             if (!useFutures &&
                 finalNotional > balance)
             {
@@ -1219,7 +1146,6 @@ namespace TradingBotEngine.Services
                     $"Order for '{symbol}' was blocked because final order value exceeds available balance.");
             }
 
-            // Server-authoritative quantity.
             var quantity = calculatedQuantity;
 
             if (!useFutures &&
@@ -1251,10 +1177,6 @@ namespace TradingBotEngine.Services
                         $"Spot SELL for '{symbol}' was rejected because available {baseAsset} balance is below the exchange minimum quantity.");
                 }
             }
-
-            // ---------------------------------------------------------
-            // RESERVE IDEMPOTENCY KEY BEFORE EXCHANGE CALL
-            // ---------------------------------------------------------
 
             var pendingTrade = new Trade
             {
@@ -1335,12 +1257,6 @@ namespace TradingBotEngine.Services
                     $"Order reservation failed for symbol '{symbol}'. No exchange order was submitted.");
             }
 
-            // ---------------------------------------------------------
-            // #8.4 FINAL EMERGENCY KILL SWITCH CHECK
-            // ---------------------------------------------------------
-            // Re-read persistent state immediately before exchange
-            // submission so a kill-switch activation that occurred while
-            // the order was being prepared can still block the trade.
             var finalKillSwitchState = await _context.RiskSettings
                 .AsNoTracking()
                 .FirstOrDefaultAsync(r => r.UserId == userId);
@@ -1368,13 +1284,6 @@ namespace TradingBotEngine.Services
                     "Trading is blocked because the emergency kill switch is active.");
             }
 
-            // ---------------------------------------------------------
-            // SUBMIT ORDER TO EXCHANGE
-            // ---------------------------------------------------------
-
-            // Deterministic exchange-side id derived from the idempotency key. If the
-            // response to the submit is lost, the order can still be found on the
-            // exchange by this id (see RecoverUnknownSubmissionsAsync).
             var clientOrderId = BuildClientOrderId(userId, idempotencyKey);
 
             try
@@ -1384,20 +1293,12 @@ namespace TradingBotEngine.Services
                 var normalizedSide =
                     direction.ToUpperInvariant();
 
-                // =====================================================
-                // BINANCE
-                // =====================================================
-
                 if (client is BinanceRestClient binance)
                 {
                     var side =
                         normalizedSide == "BUY"
                             ? OrderSide.Buy
                             : OrderSide.Sell;
-
-                    // -------------------------------------------------
-                    // BINANCE FUTURES
-                    // -------------------------------------------------
 
                     if (useFutures)
                     {
@@ -1488,9 +1389,6 @@ namespace TradingBotEngine.Services
                             entryPrice ??
                             0m;
 
-                        // Exchange acceptance is not the same as a confirmed fill.
-                        // Reconciliation will move this trade to the appropriate
-                        // filled/partially-filled/open state.
                         pendingTrade.Status = "Pending";
                         pendingTrade.UpdatedAt =
                             DateTime.UtcNow;
@@ -1530,10 +1428,6 @@ namespace TradingBotEngine.Services
                             orderId,
                             result.Data?.Price ?? entryPrice);
                     }
-
-                    // -------------------------------------------------
-                    // BINANCE SPOT
-                    // -------------------------------------------------
 
                     var isSpotMarketOrder =
                         string.Equals(
@@ -1631,10 +1525,7 @@ namespace TradingBotEngine.Services
                         entryPrice ??
                         0m;
 
-                    // Exchange acceptance is not the same as a confirmed fill.
-                        // Reconciliation will move this trade to the appropriate
-                        // filled/partially-filled/open state.
-                        pendingTrade.Status = "Pending";
+                    pendingTrade.Status = "Pending";
                     pendingTrade.UpdatedAt =
                         DateTime.UtcNow;
 
@@ -1674,10 +1565,6 @@ namespace TradingBotEngine.Services
                         spot.Data?.Price ?? entryPrice);
                 }
 
-                // =====================================================
-                // BYBIT
-                // =====================================================
-
                 if (client is BybitRestClient bybit)
                 {
                     var side =
@@ -1690,14 +1577,6 @@ namespace TradingBotEngine.Services
                             ? Bybit.Net.Enums.Category.Linear
                             : Bybit.Net.Enums.Category.Spot;
 
-                    // tpslMode ("Full"/"Partial") is a Linear/Inverse (derivatives)
-                    // parameter. Bybit Spot rejects it with 170003 "unknown parameter".
-                    // Bybit Futures attaches SL/TP on the entry via tpslMode=Full.
-                    // Bybit Spot cannot attach SL/TP on the entry without the full
-                    // tpslMode=Partial + slOrderType + tpOrderType + slLimitPrice +
-                    // tpLimitPrice bundle, which this library version does not expose.
-                    // Spot protection is placed as two separate orders by
-                    // TryEnsureProtectionAsync after the entry fills.
                     var useAttachedProtection = useFutures;
 
                     Bybit.Net.Enums.StopLossTakeProfitMode? tpslMode = null;
@@ -1789,10 +1668,7 @@ namespace TradingBotEngine.Services
                     pendingTrade.OrderId =
                         bybitOrderId;
 
-                    // Exchange acceptance is not the same as a confirmed fill.
-                        // Reconciliation will move this trade to the appropriate
-                        // filled/partially-filled/open state.
-                        pendingTrade.Status = "Pending";
+                    pendingTrade.Status = "Pending";
                     pendingTrade.UpdatedAt =
                         DateTime.UtcNow;
 
@@ -1879,7 +1755,6 @@ namespace TradingBotEngine.Services
                 }
                 catch
                 {
-                    // Do not expose database or exchange internals.
                 }
 
                 return BrokerOrderResult.Fail(
@@ -1888,17 +1763,6 @@ namespace TradingBotEngine.Services
             }
         }
 
-
-        // ------------------------------------------------------------------
-        // UNKNOWN-SUBMISSION RECOVERY
-        // ------------------------------------------------------------------
-        // When an order submit throws (timeout, dropped connection) the exchange may
-        // still have accepted it. Every entry order carries a deterministic client
-        // order id, so we can ask the exchange "do you have this order?" and either
-        // adopt it (so reconciliation + protection take over) or, once we are sure it
-        // does not exist, release the slot it was holding.
-
-        // Binance and Bybit both accept 1-36 characters of [A-Za-z0-9_-].
         public static string BuildClientOrderId(int userId, string idempotencyKey)
         {
             var hash = System.Security.Cryptography.SHA256.HashData(
@@ -1918,10 +1782,6 @@ namespace TradingBotEngine.Services
             ExchangeLookupOutcome Outcome,
             string? ExchangeOrderId = null);
 
-        /// <summary>
-        /// Resolves trades stuck in PendingReconciliation that have no ExchangeOrder row.
-        /// Returns the number of trades resolved (adopted or released).
-        /// </summary>
         public async Task<int> RecoverUnknownSubmissionsAsync(
             int userId,
             CancellationToken cancellationToken = default)
@@ -1947,7 +1807,6 @@ namespace TradingBotEngine.Services
 
                 var clientOrderId = BuildClientOrderId(userId, trade.IdempotencyKey!);
 
-                // Bot trades know their market; manual trades could be spot or futures.
                 bool? botUsesFutures = null;
                 if (trade.BotId.HasValue)
                 {
@@ -1971,10 +1830,6 @@ namespace TradingBotEngine.Services
                     .ThenByDescending(b => b.Id)
                     .ToListAsync(cancellationToken);
 
-                // "Not found" only counts once EVERY connection/market combination has
-                // answered with a definitive "no such order". Any error keeps the trade
-                // unresolved, because releasing a trade that really exists on the
-                // exchange would hide a live, possibly unprotected, position.
                 var everyLookupSaidNotFound = connections.Count > 0;
                 BrokerConnection? foundConnection = null;
                 bool foundFutures = false;
@@ -2021,7 +1876,7 @@ namespace TradingBotEngine.Services
                         null);
 
                     trade.OrderId = foundOrderId;
-                    trade.Status = "Pending"; // normal reconciliation now owns it
+                    trade.Status = "Pending";
                     trade.Reason = "Recovered from the exchange by client order id after an unknown submission result.";
                     trade.UpdatedAt = DateTime.UtcNow;
 
@@ -2080,7 +1935,6 @@ namespace TradingBotEngine.Services
             string clientOrderId,
             CancellationToken cancellationToken)
         {
-            // Binance: "Order does not exist" is error code -2013.
             const int binanceOrderDoesNotExist = -2013;
 
             try
@@ -2133,8 +1987,6 @@ namespace TradingBotEngine.Services
                         ? Bybit.Net.Enums.Category.Linear
                         : Bybit.Net.Enums.Category.Spot;
 
-                    // Real-time list (open + recently closed) and history can each lag,
-                    // so check both before declaring the order missing.
                     var live = await bybit.V5Api.Trading.GetOrdersAsync(
                         category: category,
                         symbol: symbol,
@@ -2149,7 +2001,7 @@ namespace TradingBotEngine.Services
                         category: category,
                         symbol: symbol,
                         clientOrderId: clientOrderId,
-                        limit: useFutures ? 1 : (int?)null, // spot history has no limit key
+                        limit: useFutures ? 1 : (int?)null,
                         ct: cancellationToken);
 
                     var historyHit = history.Success ? history.Data?.List?.FirstOrDefault() : null;
@@ -2182,8 +2034,6 @@ namespace TradingBotEngine.Services
         private static string LimitLength(string value, int maxLength) =>
             value.Length <= maxLength ? value : value.Substring(0, maxLength);
 
-        // Binance rejects prices that are not a multiple of the symbol's tick size
-        // (PRICE_FILTER). Percent-based stop-loss/take-profit levels are not.
         private static async Task<decimal?> TryGetSpotTickSizeAsync(
             BinanceRestClient binance,
             string symbol)
@@ -2228,10 +2078,6 @@ namespace TradingBotEngine.Services
             }
         }
 
-        // Futures orders assume one-way position mode. Leverage comes from the user's
-        // risk settings and margin is isolated so one position cannot drain the account.
-        // Every call is best effort: the exchange refuses a change when the value is
-        // already set or a position is open, and that is fine.
         private static async Task EnsureFuturesAccountSettingsAsync(
             BinanceRestClient binance,
             string symbol,
@@ -2249,11 +2095,6 @@ namespace TradingBotEngine.Services
             catch { }
         }
 
-        /// <summary>
-        /// Closes an open Binance position (spot long or futures long/short) with a market
-        /// order. Protection orders are cancelled first. The exit order is saved so
-        /// reconciliation books the exit price and P&amp;L once it is confirmed.
-        /// </summary>
         public async Task<BrokerOrderResult> ClosePositionAsync(
             int userId,
             int tradeId,
@@ -2281,7 +2122,6 @@ namespace TradingBotEngine.Services
 
             async Task<BrokerOrderResult> FailCloseAsync(string message)
             {
-                // The protection orders were cancelled, so let the retry re-create them.
                 trade.ProtectionStatus = "ProtectionPending";
                 trade.Reason = LimitLength(message, 480);
                 trade.UpdatedAt = DateTime.UtcNow;
@@ -2289,7 +2129,6 @@ namespace TradingBotEngine.Services
                 return BrokerOrderResult.Fail(message);
             }
 
-            // Stops the trade from being re-protected while it is being closed.
             trade.ProtectionStatus = "Closing";
             trade.UpdatedAt = DateTime.UtcNow;
             await _context.SaveChangesAsync();
@@ -2300,13 +2139,10 @@ namespace TradingBotEngine.Services
             {
                 try
                 {
-                    // Cancelling one leg of a spot OCO cancels the whole list, so the
-                    // second call may report a failure. That is expected.
                     await CancelOrderAsync(userId, trade.Symbol, protectionOrderId!, useFutures);
                 }
                 catch
                 {
-                    // keep going: the exit order below is what matters
                 }
             }
 
@@ -2389,9 +2225,6 @@ namespace TradingBotEngine.Services
             return BrokerOrderResult.SuccessResult(exitOrderId, null);
         }
 
-        // Bybit keeps stop-loss / take-profit attached to the order or position, so there are
-        // no separate protection orders to cancel here. The exit order is saved so
-        // reconciliation books the exit price and P&L.
         private async Task<BrokerOrderResult> CloseBybitPositionAsync(
             int userId,
             Trade trade,
@@ -2411,7 +2244,6 @@ namespace TradingBotEngine.Services
             var quantity = trade.Quantity;
             if (!useFutures)
             {
-                // Fees are taken from the bought asset, so sell what is actually available.
                 var freeBase = await GetSpotAssetBalanceAsync(ExtractBaseAsset(trade.Symbol), connection);
                 if (freeBase > 0m && freeBase < quantity)
                     quantity = freeBase;
@@ -2522,7 +2354,6 @@ namespace TradingBotEngine.Services
                 if (parent == null)
                     return false;
 
-                // Bybit Futures attached SL/TP on the entry order directly.
                 if (parent.IsFutures)
                 {
                     trade.ProtectionStatus = "ExchangeManaged";
@@ -2531,8 +2362,6 @@ namespace TradingBotEngine.Services
                     return true;
                 }
 
-                // Bybit Spot: place a stop-market and a take-profit limit separately.
-                // Do not place protection until the entry has actually filled.
                 var filledQuantity = parent.FilledQuantity;
                 if (filledQuantity <= 0m)
                 {
@@ -2542,28 +2371,12 @@ namespace TradingBotEngine.Services
                     return true;
                 }
 
-                // Bybit takes its trading fee from the base asset on spot buys, so the
-                // free balance is slightly BELOW the ordered quantity. Placing a
-                // protection order for the full filled quantity gets rejected with
-                // 170131 "Insufficient balance". Cap the protection at whatever free
-                // balance is actually available.
-                var freeBase = await GetSpotAssetBalanceAsync(
-                    ExtractBaseAsset(trade.Symbol),
-                    connection);
-
-                var protectQuantity = filledQuantity;
-
-                if (freeBase > 0m && freeBase < protectQuantity)
-                    protectQuantity = freeBase;
-
-                // Floor to 4 decimals. Bybit Spot ETHUSDT lot step is 0.01, so this
-                // is more than enough precision and avoids float-precision rejections.
-                protectQuantity = Math.Floor(protectQuantity * 10000m) / 10000m;
+                var protectQuantity = Math.Floor(filledQuantity * 10000m) / 10000m;
 
                 if (protectQuantity <= 0m)
                 {
                     trade.ProtectionStatus = "ProtectionPending";
-                    trade.Reason = "Bybit Spot protection skipped: no sellable quantity after fees.";
+                    trade.Reason = "Bybit Spot protection skipped: quantity too small.";
                     trade.UpdatedAt = DateTime.UtcNow;
                     await _context.SaveChangesAsync();
                     return false;
@@ -2573,19 +2386,17 @@ namespace TradingBotEngine.Services
                     ? Bybit.Net.Enums.OrderSide.Sell
                     : Bybit.Net.Enums.OrderSide.Buy;
 
-                // Stop-loss: conditional market order triggered on last price.
+                // Stop-loss: RAW HTTP call to Bybit V5 API with orderFilter="StopOrder".
                 if (trade.StopLoss.HasValue && string.IsNullOrWhiteSpace(trade.StopLossOrderId))
                 {
-                    var sl = await bybit.V5Api.Trading.PlaceOrderAsync(
-                        category: Bybit.Net.Enums.Category.Spot,
-                        symbol: trade.Symbol,
-                        side: protectionSide,
-                        type: Bybit.Net.Enums.NewOrderType.Market,
-                        quantity: protectQuantity,
-                        triggerPrice: trade.StopLoss.Value,
-                        triggerBy: Bybit.Net.Enums.TriggerType.LastPrice);
+                    var sl = await PlaceBybitSpotStopOrderAsync(
+                        connection,
+                        trade.Symbol,
+                        protectionSide,
+                        protectQuantity,
+                        trade.StopLoss.Value);
 
-                    if (!sl.Success || sl.Data == null)
+                    if (!sl.Success || string.IsNullOrWhiteSpace(sl.OrderId))
                     {
                         trade.ProtectionStatus = "ProtectionPending";
                         trade.Reason = LimitLength($"Bybit Spot stop-loss was not accepted: {sl.Error}", 480);
@@ -2594,48 +2405,67 @@ namespace TradingBotEngine.Services
                         return false;
                     }
 
-                    trade.StopLossOrderId = sl.Data.OrderId;
+                    trade.StopLossOrderId = sl.OrderId;
                     await PersistExchangeOrderAsync(
-                        trade.UserId, trade, connection, sl.Data.OrderId,
+                        trade.UserId, trade, connection, sl.OrderId,
                         protectionSide == Bybit.Net.Enums.OrderSide.Buy ? "BUY" : "SELL",
                         "StopMarket", false, "StopLoss", parent.Id);
                 }
 
-                // Take-profit: limit order at the target price.
+                // Take-profit: Bybit Spot cannot hold both SL and TP on the same quantity.
+                // If SL is placed, we skip TP to prevent infinite 170131 retry loops.
                 if (trade.TakeProfit.HasValue && string.IsNullOrWhiteSpace(trade.TakeProfitOrderId))
                 {
-                    var tp = await bybit.V5Api.Trading.PlaceOrderAsync(
-                        category: Bybit.Net.Enums.Category.Spot,
-                        symbol: trade.Symbol,
-                        side: protectionSide,
-                        type: Bybit.Net.Enums.NewOrderType.Limit,
-                        quantity: protectQuantity,
-                        price: trade.TakeProfit.Value);
-
-                    if (!tp.Success || tp.Data == null)
+                    if (!string.IsNullOrWhiteSpace(trade.StopLossOrderId))
                     {
-                        trade.ProtectionStatus = "ProtectionPending";
-                        trade.Reason = LimitLength($"Bybit Spot take-profit was not accepted: {tp.Error}", 480);
-                        trade.UpdatedAt = DateTime.UtcNow;
-                        await _context.SaveChangesAsync();
-                        return false;
+                        trade.Reason = "Bybit Spot limitation: Take-profit skipped because Stop-loss is active.";
                     }
+                    else
+                    {
+                        var tp = await bybit.V5Api.Trading.PlaceOrderAsync(
+                            category: Bybit.Net.Enums.Category.Spot,
+                            symbol: trade.Symbol,
+                            side: protectionSide,
+                            type: Bybit.Net.Enums.NewOrderType.Limit,
+                            quantity: protectQuantity,
+                            price: trade.TakeProfit.Value);
 
-                    trade.TakeProfitOrderId = tp.Data.OrderId;
-                    await PersistExchangeOrderAsync(
-                        trade.UserId, trade, connection, tp.Data.OrderId,
-                        protectionSide == Bybit.Net.Enums.OrderSide.Buy ? "BUY" : "SELL",
-                        "TakeProfit", false, "TakeProfit", parent.Id);
+                        if (!tp.Success || tp.Data == null)
+                        {
+                            trade.ProtectionStatus = "ProtectionPending";
+                            trade.Reason = LimitLength($"Bybit Spot take-profit was not accepted: {tp.Error}", 480);
+                            trade.UpdatedAt = DateTime.UtcNow;
+                            await _context.SaveChangesAsync();
+                            return false;
+                        }
+
+                        trade.TakeProfitOrderId = tp.Data.OrderId;
+                        await PersistExchangeOrderAsync(
+                            trade.UserId, trade, connection, tp.Data.OrderId,
+                            protectionSide == Bybit.Net.Enums.OrderSide.Buy ? "BUY" : "SELL",
+                            "TakeProfit", false, "TakeProfit", parent.Id);
+                    }
                 }
 
-                trade.ProtectionStatus = "Protected";
-                trade.Reason = null;
+                // Honest Status Tracking (Option A)
+                var hasSl = !string.IsNullOrWhiteSpace(trade.StopLossOrderId);
+                var hasTp = !string.IsNullOrWhiteSpace(trade.TakeProfitOrderId);
+
+                if (hasSl && hasTp)
+                    trade.ProtectionStatus = "Protected";
+                else if (hasSl)
+                    trade.ProtectionStatus = "SLOnly";
+                else if (hasTp)
+                    trade.ProtectionStatus = "TPOnly";
+                else
+                    trade.ProtectionStatus = "ProtectionFailed";
+
                 trade.UpdatedAt = DateTime.UtcNow;
                 _context.AuditLogs.Add(new AuditLog
                 {
                     UserId = trade.UserId,
                     Action = "ProtectionOrdersCreated",
-                    Details = $"Bybit Spot protection created for trade {trade.Id}. SL={trade.StopLossOrderId ?? "none"}, TP={trade.TakeProfitOrderId ?? "none"}.",
+                    Details = $"Bybit Spot protection created for trade {trade.Id}. Status={trade.ProtectionStatus}, SL={trade.StopLossOrderId ?? "none"}, TP={trade.TakeProfitOrderId ?? "none"}.",
                     CreatedAt = DateTime.UtcNow
                 });
                 await _context.SaveChangesAsync();
@@ -2776,9 +2606,6 @@ namespace TradingBotEngine.Services
                 if (!trade.StopLoss.HasValue || !trade.TakeProfit.HasValue)
                     return false;
 
-                // The exchange takes its fee from the bought asset, so the free balance
-                // can be slightly below the filled quantity. Protect what can be sold,
-                // rounded down to the lot size.
                 var protectQuantity = filledSpotQuantity;
                 var freeBase = await GetSpotAssetBalanceAsync(ExtractBaseAsset(trade.Symbol), connection);
                 if (freeBase > 0m && freeBase < protectQuantity)
@@ -2866,6 +2693,113 @@ namespace TradingBotEngine.Services
             }
         }
 
+        // ------------------------------------------------------------------
+        // RAW BYBIT SPOT CONDITIONAL ORDER (WORKAROUND)
+        // ------------------------------------------------------------------
+        private async Task<BrokerOrderResult> PlaceBybitSpotStopOrderAsync(
+            BrokerConnection connection,
+            string symbol,
+            Bybit.Net.Enums.OrderSide side,
+            decimal quantity,
+            decimal triggerPrice)
+
+        {   
+            try
+            {
+                var apiKey = _protector.Unprotect(connection.ApiKey);
+                var apiSecret = _protector.Unprotect(connection.ApiSecret);
+
+                var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+                const string recvWindow = "20000";   
+
+                var sideString = side == Bybit.Net.Enums.OrderSide.Buy ? "Buy" : "Sell";
+                var qtyString = quantity.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                var triggerString = triggerPrice.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+                var bodyJson =
+                     "{" +
+                    "\"category\":\"spot\"," +
+                    $"\"symbol\":\"{symbol}\"," +
+                    $"\"side\":\"{sideString}\"," +
+                    "\"orderType\":\"Market\"," +
+                    $"\"qty\":\"{qtyString}\"," +
+                    $"\"triggerPrice\":\"{triggerString}\"," +
+                    "\"triggerDirection\":2," +
+                    "\"triggerBy\":\"LastPrice\"," +
+                    "\"closeOnTrigger\":true," +  // <-- THE FIX
+                    "\"orderFilter\":\"StopOrder\"" +
+                    "}";   
+                    
+
+                var signaturePayload = timestamp + apiKey + recvWindow + bodyJson;
+
+                using var hmac = new System.Security.Cryptography.HMACSHA256(
+                    System.Text.Encoding.UTF8.GetBytes(apiSecret));
+
+                var signatureBytes = hmac.ComputeHash(
+                    System.Text.Encoding.UTF8.GetBytes(signaturePayload));
+
+                var signature = Convert.ToHexString(signatureBytes).ToLowerInvariant();
+  
+                var baseUrl = connection.IsTestnet
+                    ? "https://api-demo.bybit.com"
+                    : "https://api.bybit.com";
+
+                using var httpClient = new System.Net.Http.HttpClient();
+                httpClient.Timeout = TimeSpan.FromSeconds(30);
+
+                var request = new System.Net.Http.HttpRequestMessage(
+                    System.Net.Http.HttpMethod.Post,
+                    baseUrl + "/v5/order/create");
+
+                request.Headers.Add("X-BAPI-API-KEY", apiKey);
+                request.Headers.Add("X-BAPI-TIMESTAMP", timestamp);
+                request.Headers.Add("X-BAPI-SIGN", signature);
+                request.Headers.Add("X-BAPI-RECV-WINDOW", recvWindow);
+
+                request.Content = new System.Net.Http.StringContent(
+                    bodyJson,
+                    System.Text.Encoding.UTF8,
+                    "application/json");
+
+                var response = await httpClient.SendAsync(request);
+                var responseJson = await response.Content.ReadAsStringAsync();
+
+                using var doc = System.Text.Json.JsonDocument.Parse(responseJson);
+                var root = doc.RootElement;
+
+                if (!root.TryGetProperty("retCode", out var retCodeElement))
+                    return BrokerOrderResult.Fail($"Bybit response missing retCode: {responseJson}");
+
+                var retCode = retCodeElement.GetInt32();
+
+                if (retCode != 0)
+                {
+                    var retMsg = root.TryGetProperty("retMsg", out var msgEl)
+                        ? msgEl.GetString() ?? "unknown"
+                        : "unknown";
+
+                    return BrokerOrderResult.Fail($"Bybit API error {retCode}: {retMsg}");
+                }
+
+                if (!root.TryGetProperty("result", out var resultEl) ||
+                    !resultEl.TryGetProperty("orderId", out var orderIdEl))
+                {
+                    return BrokerOrderResult.Fail($"Bybit response missing orderId: {responseJson}");
+                }
+
+                var orderId = orderIdEl.GetString();
+
+                if (string.IsNullOrWhiteSpace(orderId))
+                    return BrokerOrderResult.Fail("Bybit returned an empty orderId.");
+
+                return BrokerOrderResult.SuccessResult(orderId, null);
+            }
+            catch (Exception ex)
+            {
+                return BrokerOrderResult.Fail($"Raw HTTP order placement failed: {ex.Message}");
+            }
+        }
 
         private async Task<bool> PersistSpotOcoProtectionOrdersAsync(
             Trade trade,
@@ -3141,8 +3075,6 @@ namespace TradingBotEngine.Services
                 return false;
             }
 
-            // Verify local ownership before making an exchange cancellation
-            // request. This keeps arbitrary order IDs out of the exchange call.
             var localOrder = await _context.ExchangeOrders
                 .AsNoTracking()
                 .FirstOrDefaultAsync(o =>
@@ -3221,7 +3153,6 @@ namespace TradingBotEngine.Services
             return false;
         }
 
-
         public async Task<bool> CancelOpenExchangeOrderForUserAsync(
             int userId,
             string symbol,
@@ -3252,8 +3183,6 @@ namespace TradingBotEngine.Services
                 if (client is not BinanceRestClient binance)
                     return false;
 
-                // Only allow cancellation of an order that Binance currently
-                // reports as open for this exact user's own testnet account.
                 var openOrders = await binance.SpotApi.Trading.GetOpenOrdersAsync(symbol);
                 if (!openOrders.Success || openOrders.Data == null)
                     return false;
@@ -3456,8 +3385,6 @@ namespace TradingBotEngine.Services
                 }
                 catch (Exception verifyException) when (attempt < maxAttempts)
                 {
-                    // Verification is a read-only operation, so retrying a
-                    // transient DNS/network/API failure is safe.
                     Console.Error.WriteLine(
                         $"[BrokerVerify] attempt {attempt}/{maxAttempts} threw: {verifyException.Message}");
                 }
