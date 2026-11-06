@@ -42,7 +42,7 @@ namespace TradingBotEngine.Services
                 return Failure("Password must contain at least 12 characters, including upper-case, lower-case, a number, and a symbol.");
 
             var now = DateTime.UtcNow;
-            var trialEnd = now.AddDays(15);
+            var trialEnd = now.AddDays(21);
 
             var user = new User
             {
@@ -85,7 +85,7 @@ namespace TradingBotEngine.Services
             // The user must be persisted before a token is generated so the JWT contains the real DB id.
             await _context.SaveChangesAsync();
 
-            return await CreateSuccessResultAsync(user, subscription, "Registration successful! Your 15-day free trial has started.");
+            return await CreateSuccessResultAsync(user, subscription, "Registration successful! Your 21-day free trial has started.");
         }
 
         public async Task<AuthResult> LoginAsync(LoginRequest request)

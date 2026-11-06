@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
+using Microsoft.AspNetCore.SignalR; 
 using Microsoft.OpenApi.Models;
 using System.Text;
 using TradingBotEngine.API.Hubs;
@@ -96,7 +97,8 @@ builder.Services.AddScoped<IndicatorCalculator>();
 builder.Services.AddScoped<SignalGenerator>();
 builder.Services.AddScoped<IReconciliationService, ReconciliationService>();
 builder.Services.AddHostedService<AutoTradeService>();
-
+builder.Services.AddSingleton<ITradingRealtimePublisher, TradingBotEngine.API.Hubs.SignalRTradingRealtimePublisher>();
+builder.Services.AddSingleton<IUserIdProvider, TradingBotEngine.API.Hubs.TradingHubUserIdProvider>();
 builder.Services.AddScoped<TelegramCommandHandler>();
 builder.Services.AddSingleton<TelegramBotService>();
 builder.Services.AddHostedService<TelegramBotService>();

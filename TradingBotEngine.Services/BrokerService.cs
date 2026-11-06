@@ -3490,4 +3490,4 @@ namespace TradingBotEngine.Services
                 Error = error
             };
     }
-}
+}                

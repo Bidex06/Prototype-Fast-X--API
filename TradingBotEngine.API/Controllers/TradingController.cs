@@ -4,6 +4,8 @@ using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using System.Security.Claims;
 using TradingBotEngine.API.DTOs.Trading;
+using TradingBotEngine.Core;
+using TradingBotEngine.Core.Models;
 using TradingBotEngine.Data;
 using TradingBotEngine.Data.Models;
 using TradingBotEngine.Services;
@@ -17,13 +19,22 @@ public sealed class TradingController : ControllerBase
 {
     private readonly ApplicationDbContext _context;
     private readonly BrokerService _brokerService;
+    private readonly ExchangeMarketDataService _marketData;
+    private readonly IndicatorCalculator _indicatorCalculator;
+    private readonly SignalGenerator _signalGenerator;
 
     public TradingController(
         ApplicationDbContext context,
-        BrokerService brokerService)
+        BrokerService brokerService,
+        ExchangeMarketDataService marketData,
+        IndicatorCalculator indicatorCalculator,
+        SignalGenerator signalGenerator)
     {
         _context = context;
         _brokerService = brokerService;
+        _marketData = marketData;
+        _indicatorCalculator = indicatorCalculator;
+        _signalGenerator = signalGenerator;
     }
 
     [HttpGet("balance")]
@@ -109,6 +120,57 @@ public sealed class TradingController : ControllerBase
             GeneratedAt = signal.GeneratedAt,
             WasExecuted = signal.WasExecuted
         });
+    }
+
+    [HttpPost("analyze")]
+    public async Task<IActionResult> AnalyzeSignal([FromBody] AnalyzeRequestDto request)
+    {
+        if (!TryGetUserId(out var userId))
+            return Unauthorized(new { message = "Invalid user identity." });
+
+        var connection = await _context.BrokerConnections
+            .FirstOrDefaultAsync(b => b.UserId == userId && b.IsActive && b.IsConnected && b.Id == request.ConnectionId);
+
+        if (connection == null)
+            return BadRequest(new { message = "Active broker connection not found." });
+
+        try
+        {
+            // 1. Fetch HTF for Macro Bias
+            var htf15m = await _marketData.GetCandlesAsync(connection.BrokerName, request.Symbol, "15m", request.UseFutures, 250, connection.IsTestnet);
+            var htf1h = await _marketData.GetCandlesAsync(connection.BrokerName, request.Symbol, "1h", request.UseFutures, 250, connection.IsTestnet);
+            
+            var bias15m = CalculateMacroBias(htf15m);
+            var bias1h = CalculateMacroBias(htf1h);
+
+            // 2. Fetch Primary Timeframe
+            var candles = await _marketData.GetCandlesAsync(connection.BrokerName, request.Symbol, request.Timeframe, request.UseFutures, 250, connection.IsTestnet);
+
+            if (candles.Count < 200)
+                return BadRequest(new { message = "Not enough market data to analyze." });
+
+            // 3. Calculate Indicators & Generate Signal
+            var indicators = await _indicatorCalculator.CalculateIndicators(candles.ToList());
+            var signal = await _signalGenerator.GenerateSignal(request.Symbol, candles.ToList(), indicators, bias15m, bias1h);
+
+            return Ok(new
+            {
+                action = signal.Action,
+                confidence = signal.Confidence,
+                price = signal.Price,
+                stopLoss = signal.StopLoss,
+                takeProfit = signal.TakeProfit,
+                reason = signal.Reason,
+                trend = signal.Trend,
+                rsi = signal.Rsi,
+                bias15m = bias15m,
+                bias1h = bias1h
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { message = $"Analysis failed: {ex.Message}" });
+        }
     }
 
     [HttpGet("tracked-symbols")]
@@ -571,10 +633,23 @@ public sealed class TradingController : ControllerBase
         return Ok(positions);
     }
 
+    private string CalculateMacroBias(IReadOnlyList<Candle> candles)
+    {
+        if (candles == null || candles.Count < 50) return "Neutral";
+        
+        var closes = candles.Select(c => (decimal)c.Close).ToList();
+        var sma50 = closes.TakeLast(50).Average();
+        var currentPrice = closes.Last();
+
+        if (currentPrice > sma50 * 1.01m) return "Uptrend"; 
+        if (currentPrice < sma50 * 0.99m) return "Downtrend"; 
+        return "Neutral";
+    }
+
     private bool TryGetUserId(out int userId)
     {
         return int.TryParse(
             User.FindFirstValue(ClaimTypes.NameIdentifier),
             out userId);
     }
-}
+}   

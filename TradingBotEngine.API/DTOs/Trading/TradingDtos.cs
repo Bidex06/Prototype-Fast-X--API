@@ -28,6 +28,19 @@ public sealed class SignalResponseDto
     public bool WasExecuted { get; set; }
 }
 
+public sealed class AnalyzeRequestDto
+{
+    [Required]
+    public string Symbol { get; set; } = string.Empty;
+    
+    [Required]
+    public string Timeframe { get; set; } = "15m";
+    
+    public bool UseFutures { get; set; } = false;
+    
+    public int ConnectionId { get; set; }
+}
+
 public sealed class PlaceOrderRequestDto
 {
     [Required]
