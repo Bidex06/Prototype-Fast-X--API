@@ -194,7 +194,7 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-app.UseHttpsRedirection();
+// app.UseHttpsRedirection(); // Handled by Render's load balancer 
 app.UseCors("AllowReactApp");
 app.UseAuthentication();
 app.UseAuthorization();
