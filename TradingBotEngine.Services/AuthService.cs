@@ -295,7 +295,7 @@ namespace TradingBotEngine.Services
             Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
 
         private static bool HasStrongPassword(string password) =>
-            password.Length >= 12 &&
+            password.Length >= 8 &&
             password.Length <= 128 &&
             password.Any(char.IsUpper) &&
             password.Any(char.IsLower) &&
