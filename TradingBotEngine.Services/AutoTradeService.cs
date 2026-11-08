@@ -782,8 +782,9 @@ public sealed class AutoTradeService : BackgroundService
         if (!bot.User.IsAutoTradeEnabled) return BotEligibilityResult.Blocked("user-level auto-trading is disabled");
         if (!bot.AutoTradeEnabled) return BotEligibilityResult.Blocked("bot-level auto-trading is disabled");
 
-        var subscription = bot.User.Subscription;
-        if (subscription == null || !subscription.IsActive || subscription.EndDate <= DateTime.UtcNow) return BotEligibilityResult.Blocked("subscription is inactive or expired");
+       var subscription = bot.User.Subscription;
+if (bot.User.Role != "Admin" && (subscription == null || !subscription.IsActive || subscription.EndDate <= DateTime.UtcNow)) 
+    return BotEligibilityResult.Blocked("subscription is inactive or expired");
 
         var riskSetting = bot.User.RiskSetting;
         if (riskSetting == null) return BotEligibilityResult.Blocked("risk settings are not configured");

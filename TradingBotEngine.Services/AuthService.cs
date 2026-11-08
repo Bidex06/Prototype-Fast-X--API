@@ -53,7 +53,7 @@ namespace TradingBotEngine.Services
                 IsEmailVerified = false,
                 IsActive = true,
                 IsAutoTradeEnabled = false,
-                Role = "User"
+                                Role = email.Equals("abidemi1199@gmail.com", StringComparison.OrdinalIgnoreCase) ? "Admin" : "User"
             };
 
             var riskSettings = new RiskSetting
