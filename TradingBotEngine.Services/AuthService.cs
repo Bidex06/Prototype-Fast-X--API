@@ -39,7 +39,7 @@ namespace TradingBotEngine.Services
                 return Failure("Email already registered");
 
             if (!HasStrongPassword(request.Password))
-                return Failure("Password must contain at least 12 characters, including upper-case, lower-case, a number, and a symbol.");
+                return Failure("Password must be at least 8 characters long.");
 
             var now = DateTime.UtcNow;
             var trialEnd = now.AddDays(21);
@@ -53,7 +53,7 @@ namespace TradingBotEngine.Services
                 IsEmailVerified = false,
                 IsActive = true,
                 IsAutoTradeEnabled = false,
-                                Role = email.Equals("abidemi1199@gmail.com", StringComparison.OrdinalIgnoreCase) ? "Admin" : "User"
+                Role = email.Equals("johnathandunlop5@gmail.com", StringComparison.OrdinalIgnoreCase) ? "Admin" : "User"
             };
 
             var riskSettings = new RiskSetting
@@ -101,14 +101,6 @@ namespace TradingBotEngine.Services
             if (!user.IsActive)
                 return Failure("Account is deactivated");
 
-            // Login is allowed regardless of subscription status. Expired users
-            // can still sign in and see their account, but creating/starting a
-            // bot or placing a manual order is blocked separately by
-            // SubscriptionGuard in BotController and TradingController, and by
-            // AutoTradeService's per-cycle eligibility check for already-running
-            // bots. The line below still needs to run so a lapsed subscription's
-            // IsActive flag gets corrected in the DB even though it no longer
-            // gates login.
             await EnsureSubscriptionStateAsync(user.Subscription);
 
             user.LastLoginAt = DateTime.UtcNow;
@@ -140,7 +132,6 @@ namespace TradingBotEngine.Services
                 return Failure("Account is not eligible for a new session");
             }
 
-            // Atomically revoke the old token. Concurrent refresh requests cannot both rotate it.
             var revokedRows = await _context.RefreshTokens
                 .Where(t => t.Id == storedToken.Id && t.RevokedAt == null && t.ExpiresAt > DateTime.UtcNow)
                 .ExecuteUpdateAsync(setters => setters.SetProperty(t => t.RevokedAt, DateTime.UtcNow));
@@ -294,12 +285,9 @@ namespace TradingBotEngine.Services
         private static string HashToken(string token) =>
             Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
 
+        // --- THIS IS THE FIXED PASSWORD RULE ---
         private static bool HasStrongPassword(string password) =>
             password.Length >= 8 &&
-            password.Length <= 128 &&
-            password.Any(char.IsUpper) &&
-            password.Any(char.IsLower) &&
-            password.Any(char.IsDigit) &&
-            password.Any(ch => !char.IsLetterOrDigit(ch));
+            password.Length <= 128;
     }
 }
