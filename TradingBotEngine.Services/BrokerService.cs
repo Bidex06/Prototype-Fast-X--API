@@ -1136,15 +1136,40 @@ namespace TradingBotEngine.Services
                     $"Order for '{symbol}' was rejected because final order value is below the exchange minimum.");
             }
 
-            if (!useFutures &&
-                finalNotional > balance)
+            // --- SPOT FEE BUFFER FIX ---
+            // For Spot (non-futures) orders, leave a 0.5% buffer to pay for exchange trading fees.
+            // Otherwise, a 100% balance order will fail when placing the Stop-Loss/Take-Profit (OCO) 
+            // because the fees are deducted from the received base asset.
+            if (!useFutures)
             {
-                return await AuditOrderFailureAsync(
-                    userId,
-                    "OrderBlocked_InsufficientBalance",
-                    "Final order value exceeds available balance.",
-                    $"Order for '{symbol}' was blocked because final order value exceeds available balance.");
+                var maxAllowedNotional = balance * 0.995m;
+
+                if (finalNotional > maxAllowedNotional)
+                {
+                    calculatedQuantity = Math.Floor((maxAllowedNotional / sizingPrice) / rules.QuantityStep) * rules.QuantityStep;
+                    
+                    if (calculatedQuantity <= 0m)
+                    {
+                        return await AuditOrderFailureAsync(
+                            userId,
+                            "OrderValidationFailed",
+                            "Calculated quantity became zero after applying the Spot fee buffer.",
+                            $"Order for '{symbol}' was rejected because quantity became zero after applying the Spot fee buffer.");
+                    }
+
+                    if (calculatedQuantity < rules.MinQuantity)
+                    {
+                        return await AuditOrderFailureAsync(
+                            userId,
+                            "OrderValidationFailed",
+                            "Calculated quantity is below the exchange minimum after applying the Spot fee buffer.",
+                            $"Order for '{symbol}' was rejected because calculated quantity is below the exchange minimum after applying the Spot fee buffer.");
+                    }
+
+                    finalNotional = calculatedQuantity * sizingPrice;
+                }
             }
+            // ---------------------------
 
             var quantity = calculatedQuantity;
 
@@ -3485,9 +3510,9 @@ namespace TradingBotEngine.Services
         public static BrokerOrderResult Fail(
             string error) =>
             new()
-            {
+            {  
                 Success = false,
                 Error = error
             };
     }
-}                
+}         
