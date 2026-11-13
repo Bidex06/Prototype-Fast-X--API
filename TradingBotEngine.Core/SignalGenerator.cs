@@ -39,8 +39,7 @@ namespace TradingBotEngine.Core
             TryGetBool(indicators, "BullishRejection", out var bullishRejection);
             TryGetBool(indicators, "BearishRejection", out var bearishRejection);
             TryGetBool(indicators, "VolumeSpike", out var volumeSpike);
-            TryGetBool(indicators, "RetestedMaFromAbove", out var retestUp);
-            TryGetBool(indicators, "RetestedMaFromBelow", out var retestDown);
+            
             TryGetBool(indicators, "BrokenResistanceIsSupport", out var roleReversalBull);
             TryGetBool(indicators, "BrokenSupportIsResistance", out var roleReversalBear);
 
@@ -50,27 +49,27 @@ namespace TradingBotEngine.Core
             signal.Resistance = resistance;
 
             // ==========================================
-            // BUY CONDITIONS
+            // BUY CONDITIONS (Loosened: Removed retest requirement)
             // ==========================================
-            if (rsi > 50 && currentPrice > ma50 && isUptrend && bullishRejection && retestUp && volumeSpike && htf1Bias != "Downtrend")
+            if (rsi > 50 && currentPrice > ma50 && isUptrend && bullishRejection && volumeSpike && htf1Bias != "Downtrend")
             {
                 signal.Action = "BUY";
                 signal.StopLoss = support;
                 signal.TakeProfit = resistance;
-                signal.Confidence = roleReversalBull ? 90 : 75;
-                signal.Reason = $"BUY Setup: RSI({rsi:F1})>50, Price>MA50, Uptrend, Setup formed in last 3 candles, Retest MA50, Volume. HTF Bias: {htf1Bias}/{htf2Bias}.";
+                signal.Confidence = roleReversalBull ? 90 : 80;
+                signal.Reason = $"BUY Setup: RSI({rsi:F1})>50, Price>MA50, Uptrend, Bullish Rejection Candle, Volume Spike. HTF Bias: {htf1Bias}/{htf2Bias}.";
                 if (roleReversalBull) signal.Reason += " Broken Resistance acting as Support.";
             }
             // ==========================================
-            // SELL CONDITIONS
+            // SELL CONDITIONS (Loosened: Removed retest requirement)
             // ==========================================
-            else if (rsi < 50 && currentPrice < ma50 && isDowntrend && bearishRejection && retestDown && volumeSpike && htf1Bias != "Uptrend")
+            else if (rsi < 50 && currentPrice < ma50 && isDowntrend && bearishRejection && volumeSpike && htf1Bias != "Uptrend")
             {
                 signal.Action = "SELL";
                 signal.StopLoss = resistance;
                 signal.TakeProfit = support;
-                signal.Confidence = roleReversalBear ? 90 : 75;
-                signal.Reason = $"SELL Setup: RSI({rsi:F1})<50, Price<MA50, Downtrend, Setup formed in last 3 candles, Retest MA50, Volume. HTF Bias: {htf1Bias}/{htf2Bias}.";
+                signal.Confidence = roleReversalBear ? 90 : 80;
+                signal.Reason = $"SELL Setup: RSI({rsi:F1})<50, Price<MA50, Downtrend, Bearish Rejection Candle, Volume Spike. HTF Bias: {htf1Bias}/{htf2Bias}.";
                 if (roleReversalBear) signal.Reason += " Broken Support acting as Resistance.";
             }
             // ==========================================
@@ -84,9 +83,8 @@ namespace TradingBotEngine.Core
                 var missingConditions = new List<string>();
                 if (rsi <= 50 && rsi >= 50) missingConditions.Add("RSI Neutral");
                 if (!isUptrend && !isDowntrend) missingConditions.Add("No clear trend");
-                if (!bullishRejection && !bearishRejection) missingConditions.Add("No recent rejection candle");
-                if (!volumeSpike) missingConditions.Add("No recent volume spike");
-                if (!retestUp && !retestDown) missingConditions.Add("No MA50 retest");
+                if (!bullishRejection && !bearishRejection) missingConditions.Add("No rejection candle in last 3 candles");
+                if (!volumeSpike) missingConditions.Add("No volume spike");
                 
                 signal.Reason = $"HOLD (Ranging): Missing conditions. {string.Join(", ", missingConditions)}.";
             }
@@ -111,4 +109,4 @@ namespace TradingBotEngine.Core
             catch { return false; }
         }
     }
-} 
+}     
