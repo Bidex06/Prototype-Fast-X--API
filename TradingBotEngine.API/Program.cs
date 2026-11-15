@@ -181,7 +181,7 @@ builder.Services.AddSignalR();
 
 // Bybit "testnet" connections use Bybit Demo Trading when this is on (see BybitEnvironments).
 BybitEnvironments.UseDemoTrading = builder.Configuration.GetValue<bool>("Bybit:UseDemoTrading");
-
+BinanceEnvironments.UseDemoTrading = builder.Configuration.GetValue<bool>("Binance:UseDemoTrading");
 var app = builder.Build();
 
 if (string.IsNullOrWhiteSpace(dataProtectionKeysPath) && !app.Environment.IsDevelopment())

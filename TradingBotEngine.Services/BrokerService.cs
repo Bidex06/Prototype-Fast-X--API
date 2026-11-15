@@ -1137,9 +1137,6 @@ namespace TradingBotEngine.Services
             }
 
             // --- SPOT FEE BUFFER FIX ---
-            // For Spot (non-futures) orders, leave a 0.5% buffer to pay for exchange trading fees.
-            // Otherwise, a 100% balance order will fail when placing the Stop-Loss/Take-Profit (OCO) 
-            // because the fees are deducted from the received base asset.
             if (!useFutures)
             {
                 var maxAllowedNotional = balance * 0.995m;
@@ -2438,7 +2435,6 @@ namespace TradingBotEngine.Services
                 }
 
                 // Take-profit: Bybit Spot cannot hold both SL and TP on the same quantity.
-                // If SL is placed, we skip TP to prevent infinite 170131 retry loops.
                 if (trade.TakeProfit.HasValue && string.IsNullOrWhiteSpace(trade.TakeProfitOrderId))
                 {
                     if (!string.IsNullOrWhiteSpace(trade.StopLossOrderId))
@@ -3356,10 +3352,9 @@ namespace TradingBotEngine.Services
                 var client =
                     new BinanceRestClient(options =>
                     {
-                        options.Environment =
-                            connection.IsTestnet
-                                ? BinanceEnvironment.Testnet
-                                : BinanceEnvironment.Live;
+                        options.Environment = connection.IsTestnet 
+                            ? BinanceEnvironment.Testnet 
+                            : BinanceEnvironment.Live;
                     });
 
                 client.SetApiCredentials(
@@ -3515,4 +3510,4 @@ namespace TradingBotEngine.Services
                 Error = error
             };
     }
-}         
+}    

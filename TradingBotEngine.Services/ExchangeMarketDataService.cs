@@ -67,11 +67,10 @@ public sealed class ExchangeMarketDataService
             throw new ArgumentException("Symbol is required.", nameof(symbol));
 
         symbol = symbol.Trim().ToUpperInvariant();
+        
         var client = new BinanceRestClient(options =>
         {
-            options.Environment = isTestnet
-                ? BinanceEnvironment.Testnet
-                : BinanceEnvironment.Live;
+            options.Environment = isTestnet ? BinanceEnvironment.Testnet : BinanceEnvironment.Live;
         });
 
         if (useFutures)
@@ -243,8 +242,6 @@ public sealed class ExchangeMarketDataService
         if (_cache.TryGetValue(key, out IReadOnlyList<MarketSymbol>? cached) && cached != null)
             return cached;
 
-        // Demo Trading uses live symbols and prices, so only the separate Bybit
-        // testnet site (UseDemoTrading off) has its own instrument list.
         var baseUrl = (isTestnet && !BybitEnvironments.UseDemoTrading)
             ? "https://api-testnet.bybit.com"
             : "https://api.bybit.com";
@@ -301,6 +298,7 @@ public sealed class ExchangeMarketDataService
     private static async Task<IReadOnlyList<Candle>> GetBinanceCandlesAsync(string symbol, string timeframe, bool useFutures, int limit, bool isTestnet)
     {
         var interval = ParseBinanceInterval(timeframe);
+        
         var client = new BinanceRestClient(options =>
         {
             options.Environment = isTestnet ? BinanceEnvironment.Testnet : BinanceEnvironment.Live;
@@ -440,4 +438,4 @@ public sealed class ExchangeMarketDataService
         string Exchange,
         string Market,
         string Status);
-}
+}    
