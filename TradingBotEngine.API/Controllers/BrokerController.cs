@@ -84,6 +84,9 @@ public class BrokerController : ControllerBase
             IsTestnet = true,
             IsLiveTradingEnabled = false,
 
+ IsFutures = request.UseFutures,  
+
+
             CreatedAt = DateTime.UtcNow
         };
 

@@ -31,6 +31,9 @@ namespace TradingBotEngine.Data.Models
 
         /// <summary>Explicit opt-in required before a live order may be sent.</summary>
         public bool IsLiveTradingEnabled { get; set; } = false;
+
+
+        public bool IsFutures { get; set; }  
         public DateTime? LiveTradingOptInAt { get; set; }
 
         public DateTime? LastConnectedAt { get; set; }

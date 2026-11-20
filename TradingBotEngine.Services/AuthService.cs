@@ -23,6 +23,15 @@ namespace TradingBotEngine.Services
             _configuration = configuration;
         }
 
+        // The first admin is chosen by configuration (Admin:BootstrapEmail), not hard-coded.
+        // Leave it empty once your admin account exists.
+        private bool IsBootstrapAdmin(string email)
+        {
+            var configured = _configuration["Admin:BootstrapEmail"];
+            return !string.IsNullOrWhiteSpace(configured) &&
+                   email.Equals(configured.Trim(), StringComparison.OrdinalIgnoreCase);
+        }
+
         public async Task<AuthResult> RegisterAsync(RegisterRequest request)
         {
             var email = NormalizeEmail(request.Email);
@@ -53,7 +62,7 @@ namespace TradingBotEngine.Services
                 IsEmailVerified = false,
                 IsActive = true,
                 IsAutoTradeEnabled = false,
-                Role = email.Equals("johnathandunlop5@gmail.com", StringComparison.OrdinalIgnoreCase) ? "Admin" : "User"
+                Role = IsBootstrapAdmin(email) ? "Admin" : "User"
             };
 
             var riskSettings = new RiskSetting
@@ -107,6 +116,19 @@ namespace TradingBotEngine.Services
             await _context.SaveChangesAsync();
 
             return await CreateSuccessResultAsync(user, user.Subscription, "Login successful");
+        }
+
+        // Revokes the refresh token so "logout" actually ends the session on the server,
+        // instead of only deleting it from the browser.
+        public async Task LogoutAsync(string refreshToken)
+        {
+            if (string.IsNullOrWhiteSpace(refreshToken))
+                return;
+
+            var tokenHash = HashToken(refreshToken);
+            await _context.RefreshTokens
+                .Where(t => t.TokenHash == tokenHash && t.RevokedAt == null)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(t => t.RevokedAt, DateTime.UtcNow));
         }
 
         public async Task<AuthResult> RefreshTokenAsync(string refreshToken)

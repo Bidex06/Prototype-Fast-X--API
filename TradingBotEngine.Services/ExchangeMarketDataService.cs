@@ -70,7 +70,7 @@ public sealed class ExchangeMarketDataService
         
         var client = new BinanceRestClient(options =>
         {
-            options.Environment = isTestnet ? BinanceEnvironment.Testnet : BinanceEnvironment.Live;
+            options.Environment = BinanceEnvironments.ForTrading(isTestnet);
         });
 
         if (useFutures)
@@ -219,9 +219,14 @@ public sealed class ExchangeMarketDataService
         if (_cache.TryGetValue(key, out IReadOnlyList<MarketSymbol>? cached) && cached != null)
             return cached;
 
+        var demo = isTestnet && BinanceEnvironments.UseDemoTrading;
         var url = useFutures
-            ? (isTestnet ? "https://testnet.binancefuture.com/fapi/v1/exchangeInfo" : "https://fapi.binance.com/fapi/v1/exchangeInfo")
-            : (isTestnet ? "https://testnet.binance.vision/api/v3/exchangeInfo" : "https://api.binance.com/api/v3/exchangeInfo");
+            ? (demo
+                ? "https://demo-fapi.binance.com/fapi/v1/exchangeInfo"
+                : (isTestnet ? "https://testnet.binancefuture.com/fapi/v1/exchangeInfo" : "https://fapi.binance.com/fapi/v1/exchangeInfo"))
+            : (demo
+                ? "https://demo-api.binance.com/api/v3/exchangeInfo"
+                : (isTestnet ? "https://testnet.binance.vision/api/v3/exchangeInfo" : "https://api.binance.com/api/v3/exchangeInfo"));
 
         var payload = await _httpClient.GetFromJsonAsync<BinanceExchangeInfo>(url, cancellationToken)
             ?? throw new InvalidOperationException("Binance returned an empty exchange-info response.");
@@ -301,7 +306,7 @@ public sealed class ExchangeMarketDataService
         
         var client = new BinanceRestClient(options =>
         {
-            options.Environment = isTestnet ? BinanceEnvironment.Testnet : BinanceEnvironment.Live;
+            options.Environment = BinanceEnvironments.ForMarketData(isTestnet);
         });
 
         if (useFutures)

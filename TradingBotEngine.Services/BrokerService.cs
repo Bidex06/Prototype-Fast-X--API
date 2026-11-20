@@ -765,6 +765,28 @@ namespace TradingBotEngine.Services
                     $"Order for '{symbol}' was blocked because available USDT balance was insufficient.");
             }
 
+            // Spot "equity" must include the coins the bot is holding, not only free USDT.
+            // Otherwise every buy makes equity look lower, which falsely trips the drawdown guard
+            // and shrinks the daily-loss limit. (Futures add unrealized PnL further below.)
+            var openSpotCostBasis = 0m;
+            if (!useFutures)
+            {
+                openSpotCostBasis = await _context.Trades
+                    .Where(t =>
+                        t.UserId == userId &&
+                        t.Status == "Open" &&
+                        t.BrokerName == connection.BrokerName &&
+                        t.Direction.ToUpper() == "BUY" &&
+                        _context.ExchangeOrders.Any(o =>
+                            o.TradeId == t.Id &&
+                            o.OrderRole == "Entry" &&
+                            !o.IsFutures &&
+                            o.IsTestnet == connection.IsTestnet))
+                    .SumAsync(t => (decimal?)(t.Quantity * t.EntryPrice)) ?? 0m;
+            }
+
+            var equityBalance = balance + openSpotCostBasis;
+
             var utcToday = DateTime.UtcNow.Date;
             var tomorrowUtc = utcToday.AddDays(1);
 
@@ -780,7 +802,7 @@ namespace TradingBotEngine.Services
             dailyRealizedLoss = Math.Abs(dailyRealizedLoss);
 
             var dailyLossLimitAmount =
-                balance * (riskSetting.DailyLossLimit / 100m);
+                equityBalance * (riskSetting.DailyLossLimit / 100m);
 
             if (dailyRealizedLoss >= dailyLossLimitAmount)
             {
@@ -821,7 +843,7 @@ namespace TradingBotEngine.Services
                     "Maximum drawdown is not configured correctly.");
             }
 
-            var currentEquity = balance;
+            var currentEquity = equityBalance;
 
             if (useFutures)
             {
@@ -1003,6 +1025,22 @@ namespace TradingBotEngine.Services
             else if (!useFutures)
             {
                 leverage = 1m;
+            }
+
+            if (takeProfit.HasValue && takeProfit.Value > 0m)
+            {
+                var tpIsBuyOrder = direction.Equals("BUY", StringComparison.OrdinalIgnoreCase);
+
+                if ((tpIsBuyOrder && takeProfit.Value <= sizingPrice) ||
+                    (!tpIsBuyOrder && takeProfit.Value >= sizingPrice))
+                {
+                    return await AuditOrderFailureAsync(
+                        userId,
+                        "OrderValidationFailed",
+                        "Take-profit is on the wrong side of the entry price.",
+                        $"Order for '{symbol}' was rejected: {direction.ToUpperInvariant()} take-profit {takeProfit.Value} " +
+                        $"is not on the profit side of reference price {sizingPrice}.");
+                }
             }
 
             decimal calculatedQuantity;
@@ -2168,6 +2206,10 @@ namespace TradingBotEngine.Services
                 }
             }
 
+            var hadProtectionOrders =
+                !string.IsNullOrWhiteSpace(trade.StopLossOrderId) ||
+                !string.IsNullOrWhiteSpace(trade.TakeProfitOrderId);
+
             trade.StopLossOrderId = null;
             trade.TakeProfitOrderId = null;
 
@@ -2175,9 +2217,22 @@ namespace TradingBotEngine.Services
 
             if (!useFutures)
             {
-                var freeBase = await GetSpotAssetBalanceAsync(ExtractBaseAsset(trade.Symbol), connection);
-                if (freeBase > 0m && freeBase < quantity)
-                    quantity = freeBase;
+                // Cancelling an OCO leg releases the locked coins a moment later.
+                if (hadProtectionOrders)
+                    await Task.Delay(TimeSpan.FromMilliseconds(800));
+
+                var resolved = await ResolveSpotSellQuantityAsync(trade, connection, quantity);
+
+                if (resolved.PositionGone)
+                {
+                    await MarkSpotPositionGoneAsync(trade, resolved.Problem!);
+                    return BrokerOrderResult.Fail(resolved.Problem!);
+                }
+
+                if (resolved.Problem != null)
+                    return await FailCloseAsync(resolved.Problem);
+
+                quantity = resolved.Quantity;
 
                 var stepSize = await TryGetSpotStepSizeAsync(binance, trade.Symbol);
                 if (stepSize.HasValue)
@@ -2628,9 +2683,25 @@ namespace TradingBotEngine.Services
                     return false;
 
                 var protectQuantity = filledSpotQuantity;
-                var freeBase = await GetSpotAssetBalanceAsync(ExtractBaseAsset(trade.Symbol), connection);
-                if (freeBase > 0m && freeBase < protectQuantity)
-                    protectQuantity = freeBase;
+
+                var resolvedProtect = await ResolveSpotSellQuantityAsync(trade, connection, protectQuantity);
+
+                if (resolvedProtect.PositionGone)
+                {
+                    await MarkSpotPositionGoneAsync(trade, resolvedProtect.Problem!);
+                    return false;
+                }
+
+                if (resolvedProtect.Problem != null)
+                {
+                    trade.ProtectionStatus = "ProtectionPending";
+                    trade.Reason = LimitLength($"Protection not placed: {resolvedProtect.Problem}", 480);
+                    trade.UpdatedAt = DateTime.UtcNow;
+                    await _context.SaveChangesAsync();
+                    return false;
+                }
+
+                protectQuantity = resolvedProtect.Quantity;
 
                 var stepSize = await TryGetSpotStepSizeAsync(binance, trade.Symbol);
                 if (stepSize.HasValue)
@@ -2650,6 +2721,47 @@ namespace TradingBotEngine.Services
                 {
                     trade.StopLoss = RoundToStep(trade.StopLoss.Value, tickSize.Value);
                     trade.TakeProfit = RoundToStep(trade.TakeProfit.Value, tickSize.Value);
+                }
+
+                // Binance only accepts a sell OCO when stop < market price < take-profit.
+                // If price already crossed one of them (the TP/SL come from candle highs/lows),
+                // an OCO is rejected with -2010 "relationship of the prices", so exit now instead.
+                var lastPriceResult = await binance.SpotApi.ExchangeData.GetPriceAsync(trade.Symbol);
+                if (lastPriceResult.Success && lastPriceResult.Data != null)
+                {
+                    var lastPrice = lastPriceResult.Data.Price;
+                    var takeProfitReached = lastPrice >= trade.TakeProfit.Value;
+                    var stopLossBreached = lastPrice <= trade.StopLoss.Value;
+
+                    if (takeProfitReached || stopLossBreached)
+                    {
+                        var exitReason = takeProfitReached
+                            ? $"market price {lastPrice} is already at or above the take-profit {trade.TakeProfit.Value}"
+                            : $"market price {lastPrice} is already at or below the stop-loss {trade.StopLoss.Value}";
+
+                        _context.AuditLogs.Add(new AuditLog
+                        {
+                            UserId = trade.UserId,
+                            Action = "ProtectionSkippedExitNow",
+                            Details = LimitLength(
+                                $"Trade {trade.Id} ({trade.Symbol}): OCO not placed because {exitReason}. Closing at market instead.",
+                                1000),
+                            CreatedAt = DateTime.UtcNow
+                        });
+                        await _context.SaveChangesAsync();
+
+                        var exitResult = await ClosePositionAsync(trade.UserId, trade.Id, connection, false);
+                        if (!exitResult.Success)
+                        {
+                            trade.ProtectionStatus = "ProtectionPending";
+                            trade.Reason = LimitLength(
+                                $"OCO not placed ({exitReason}) and the market exit failed: {exitResult.Error}", 480);
+                            trade.UpdatedAt = DateTime.UtcNow;
+                            await _context.SaveChangesAsync();
+                        }
+
+                        return exitResult.Success;
+                    }
                 }
 
                 var oco = await binance.SpotApi.Trading.PlaceOcoOrderAsync(
@@ -3016,6 +3128,110 @@ namespace TradingBotEngine.Services
             return 0m;
         }
 
+        // Reads free AND locked balance for an asset. Unlike GetSpotAssetBalanceAsync it never
+        // turns a failed call into "0": the caller can tell "API failed" from "really none".
+        private async Task<(bool Ok, decimal Free, decimal Locked, string? Error)> GetSpotAssetBalanceDetailAsync(
+            string asset, BrokerConnection connection)
+        {
+            try
+            {
+                var client = CreateClient(connection);
+
+                if (client is BinanceRestClient binance)
+                {
+                    var result = await binance.SpotApi.Account.GetAccountInfoAsync();
+                    if (!result.Success)
+                        return (false, 0m, 0m, result.Error?.ToString() ?? "Binance returned no balance data.");
+
+                    var balance = result.Data.Balances.FirstOrDefault(b =>
+                        b.Asset.Equals(asset, StringComparison.OrdinalIgnoreCase));
+
+                    return (true, balance?.Available ?? 0m, balance?.Locked ?? 0m, null);
+                }
+
+                if (client is BybitRestClient bybit)
+                {
+                    var result = await bybit.V5Api.Account.GetBalancesAsync(
+                        Bybit.Net.Enums.AccountType.Unified, asset, CancellationToken.None);
+                    if (!result.Success)
+                        return (false, 0m, 0m, result.Error?.ToString() ?? "Bybit returned no balance data.");
+
+                    var coin = result.Data.List?.FirstOrDefault()?.Assets?
+                        .FirstOrDefault(a => a.Asset.Equals(asset, StringComparison.OrdinalIgnoreCase));
+                    if (coin == null)
+                        return (true, 0m, 0m, null);
+
+                    var locked = coin.Locked ?? 0m;
+                    return (true, coin.Free ?? Math.Max(0m, coin.WalletBalance - locked), locked, null);
+                }
+
+                return (false, 0m, 0m, "Unsupported broker.");
+            }
+            catch (Exception ex)
+            {
+                return (false, 0m, 0m, ex.Message);
+            }
+        }
+
+        // Works out how much of the base asset can really be sold for a spot trade.
+        //  - balance call failed            -> send nothing, say why
+        //  - enough free                    -> sell the full requested quantity
+        //  - slightly short (fee in coin)   -> sell what is free (>= 90% of requested)
+        //  - exchange holds ~nothing        -> position is gone (PositionGone = true)
+        //  - coins locked in other orders   -> send nothing, say so
+        private async Task<(decimal Quantity, string? Problem, bool PositionGone)> ResolveSpotSellQuantityAsync(
+            Trade trade, BrokerConnection connection, decimal requested)
+        {
+            var asset = ExtractBaseAsset(trade.Symbol);
+            var balance = await GetSpotAssetBalanceDetailAsync(asset, connection);
+
+            if (!balance.Ok)
+                return (0m,
+                    $"Could not read the {asset} balance from the exchange ({balance.Error}). No order was sent.",
+                    false);
+
+            if (balance.Free >= requested)
+                return (requested, null, false);
+
+            if (balance.Free > 0m && balance.Free >= requested * 0.90m)
+                return (balance.Free, null, false);
+
+            if (balance.Free + balance.Locked < requested * 0.05m)
+                return (0m,
+                    $"The exchange holds almost no {asset} (free {balance.Free}, locked {balance.Locked}) " +
+                    $"but this trade expects {requested}. The position is probably already gone " +
+                    "(sold elsewhere, or the test account was reset).",
+                    true);
+
+            return (0m,
+                $"Only {balance.Free} {asset} is free ({balance.Locked} is locked in other open orders) " +
+                $"but {requested} is needed. Cancel the other open {trade.Symbol} orders and retry.",
+                false);
+        }
+
+        // The exchange no longer holds the coins, so there is nothing to sell or protect.
+        // Close the database row so it stops blocking max-open-trades and bot entries.
+        private async Task MarkSpotPositionGoneAsync(Trade trade, string message)
+        {
+            trade.Status = "Closed";
+            trade.ProtectionStatus = "NotRequired";
+            trade.StopLossOrderId = null;
+            trade.TakeProfitOrderId = null;
+            trade.ExitTime = DateTime.UtcNow;
+            trade.Reason = LimitLength("Closed without an exit order: " + message, 480);
+            trade.UpdatedAt = DateTime.UtcNow;
+
+            _context.AuditLogs.Add(new AuditLog
+            {
+                UserId = trade.UserId,
+                Action = "TradeClosedPositionMissing",
+                Details = LimitLength($"Trade {trade.Id} ({trade.Symbol}) closed in the database: {message}", 1000),
+                CreatedAt = DateTime.UtcNow
+            });
+
+            await _context.SaveChangesAsync();
+        }
+
         private static string ExtractBaseAsset(string symbol)
         {
             var normalized = symbol.Trim().ToUpperInvariant();
@@ -3352,9 +3568,7 @@ namespace TradingBotEngine.Services
                 var client =
                     new BinanceRestClient(options =>
                     {
-                        options.Environment = connection.IsTestnet 
-                            ? BinanceEnvironment.Testnet 
-                            : BinanceEnvironment.Live;
+                        options.Environment = BinanceEnvironments.ForTrading(connection.IsTestnet);
                     });
 
                 client.SetApiCredentials(
@@ -3435,7 +3649,7 @@ namespace TradingBotEngine.Services
                 if (!result.Success)
                 {
                     Console.Error.WriteLine(
-                        $"[BrokerVerify] Binance verification failed (testnet={connection.IsTestnet}): {result.Error}");
+                        $"[BrokerVerify] Binance verification failed (testnet={connection.IsTestnet}, UseDemoTrading={BinanceEnvironments.UseDemoTrading}): {result.Error}");
                 }
 
                 return result.Success;

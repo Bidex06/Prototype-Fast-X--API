@@ -750,4 +750,4 @@ namespace TradingBotEngine.Services
             return Convert.ToDecimal(value, CultureInfo.InvariantCulture);
         }
     }
-}
+}    

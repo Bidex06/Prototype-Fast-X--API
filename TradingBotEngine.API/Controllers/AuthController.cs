@@ -70,6 +70,17 @@ namespace TradingBotEngine.API.Controllers
             });
         }
 
+        // The refresh token is the credential here, so no JWT is required (the access token
+        // is often already expired when the user logs out).
+        [HttpPost("logout")]
+        [EnableRateLimiting("auth")]
+        [RequestSizeLimit(16 * 1024)]
+        public async Task<IActionResult> Logout([FromBody] RefreshRequest request)
+        {
+            await _authService.LogoutAsync(request.RefreshToken);
+            return NoContent();
+        }
+
         [HttpGet("me")]
         [Authorize]
         public async Task<IActionResult> GetMe()

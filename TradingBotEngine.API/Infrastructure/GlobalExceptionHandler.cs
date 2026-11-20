@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 
@@ -56,6 +57,24 @@ public sealed class GlobalExceptionHandler : IExceptionHandler
 
         httpContext.Response.StatusCode = statusCode;
 
+        // The exception handler resets the response, which can drop the CORS headers and make the
+        // browser show a network error instead of the real one. Re-apply the app's CORS policy.
+        try
+        {
+            var corsPolicyProvider = httpContext.RequestServices.GetRequiredService<ICorsPolicyProvider>();
+            var corsService = httpContext.RequestServices.GetRequiredService<ICorsService>();
+            var corsPolicy = await corsPolicyProvider.GetPolicyAsync(httpContext, "AllowReactApp");
+            if (corsPolicy != null)
+            {
+                var corsResult = corsService.EvaluatePolicy(httpContext, corsPolicy);
+                corsService.ApplyResult(corsResult, httpContext.Response);
+            }
+        }
+        catch (Exception corsException)
+        {
+            _logger.LogWarning(corsException, "Could not re-apply the CORS policy to an error response.");
+        }
+
         var response = new ProblemDetails
         {
             Status = statusCode,
@@ -65,6 +84,7 @@ public sealed class GlobalExceptionHandler : IExceptionHandler
         };
 
         response.Extensions["code"] = code;
+        response.Extensions["message"] = message;
         response.Extensions["traceId"] = traceId;
 
         httpContext.Response.ContentType =

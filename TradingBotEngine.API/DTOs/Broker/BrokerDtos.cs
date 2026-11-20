@@ -18,6 +18,8 @@ public sealed class ConnectBrokerRequestDto
     [Required]
     [StringLength(256, MinimumLength = 8)]
     public string ApiSecret { get; set; } = string.Empty;
+
+     public bool UseFutures { get; set; } = false; 
 }
 
 public sealed class DisconnectBrokerRequestDto

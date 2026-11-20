@@ -1,4 +1,7 @@
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.DataProtection.KeyManagement;
+using TradingBotEngine.API.Infrastructure;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -54,13 +57,43 @@ builder.Services.AddMemoryCache();
 var dataProtectionKeysPath = builder.Configuration["DataProtection:KeysPath"];
 var dataProtectionBuilder = builder.Services.AddDataProtection();
 
+var dataProtectionPersisted = false;
+var keyRingSecret = builder.Configuration["DataProtection:KeyEncryptionSecret"];
+
 if (!string.IsNullOrWhiteSpace(dataProtectionKeysPath))
 {
     Directory.CreateDirectory(dataProtectionKeysPath);
     dataProtectionBuilder
         .SetApplicationName("TradingBotEngine")
         .PersistKeysToFileSystem(new DirectoryInfo(dataProtectionKeysPath));
+    dataProtectionPersisted = true;
 }
+else
+{
+    // No disk configured (e.g. Render free tier): keep the key ring in the app's own database so
+    // stored broker keys survive restarts and redeploys. Set DataProtection:KeyEncryptionSecret
+    // to also encrypt the key ring, so a database leak alone cannot decrypt broker keys.
+    var keyRingConnection = builder.Configuration.GetConnectionString("DefaultConnection");
+    if (!string.IsNullOrWhiteSpace(keyRingConnection))
+    {
+        dataProtectionBuilder.SetApplicationName("TradingBotEngine");
+        dataProtectionBuilder.Services.Configure<KeyManagementOptions>(options =>
+            options.XmlRepository = new PostgresXmlRepository(keyRingConnection, keyRingSecret));
+        dataProtectionPersisted = true;
+    }
+}
+
+builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+builder.Services.AddProblemDetails();
+
+// Render (and most hosts) put a proxy in front of the app. Without this, every request
+// appears to come from the proxy's IP and all users share one rate-limit bucket.
+builder.Services.Configure<ForwardedHeadersOptions>(options =>
+{
+    options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    options.KnownNetworks.Clear();
+    options.KnownProxies.Clear();
+});
 
 builder.Services.AddRateLimiter(options =>
 {
@@ -78,7 +111,7 @@ builder.Services.AddRateLimiter(options =>
 
     options.AddPolicy("trading", httpContext =>
         RateLimitPartition.GetFixedWindowLimiter(
-            httpContext.User.Identity?.Name
+            httpContext.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
                 ?? httpContext.Connection.RemoteIpAddress?.ToString()
                 ?? "unknown",
             _ => new FixedWindowRateLimiterOptions
@@ -184,9 +217,16 @@ BybitEnvironments.UseDemoTrading = builder.Configuration.GetValue<bool>("Bybit:U
 BinanceEnvironments.UseDemoTrading = builder.Configuration.GetValue<bool>("Binance:UseDemoTrading");
 var app = builder.Build();
 
-if (string.IsNullOrWhiteSpace(dataProtectionKeysPath) && !app.Environment.IsDevelopment())
+app.UseForwardedHeaders();
+app.UseExceptionHandler();
+
+if (!dataProtectionPersisted && !app.Environment.IsDevelopment())
     app.Logger.LogWarning(
-        "DataProtection:KeysPath is not set. Stored broker API keys will be unreadable after a restart or redeploy.");
+        "No persistent Data Protection key store. Stored broker API keys will be unreadable after a restart or redeploy.");
+
+if (string.IsNullOrWhiteSpace(dataProtectionKeysPath) && dataProtectionPersisted && string.IsNullOrWhiteSpace(keyRingSecret))
+    app.Logger.LogWarning(
+        "DataProtection:KeyEncryptionSecret is not set: the Data Protection key ring is stored unencrypted in the database. Set it so a database leak cannot decrypt broker keys.");
 
 if (app.Environment.IsDevelopment())
 {

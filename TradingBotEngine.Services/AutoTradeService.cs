@@ -379,7 +379,9 @@ public sealed class AutoTradeService : BackgroundService
         {
             var oppositeSignal = !string.Equals(activeTrade.Direction, signal.Action, StringComparison.OrdinalIgnoreCase);
 
-            if (oppositeSignal && string.Equals(activeTrade.Status, "Open", StringComparison.OrdinalIgnoreCase))
+            var ownedByThisBot = activeTrade.BotId == bot.Id;
+
+            if (oppositeSignal && ownedByThisBot && string.Equals(activeTrade.Status, "Open", StringComparison.OrdinalIgnoreCase))
             {
                 var closeResult = await brokerService.ClosePositionAsync(bot.UserId, activeTrade.Id, broker, bot.UseFutures);
 
@@ -399,7 +401,9 @@ public sealed class AutoTradeService : BackgroundService
                 return;
             }
 
-            skipReason = "a trade for this symbol is still open, so no new position was opened.";
+            skipReason = ownedByThisBot
+                ? "a trade for this symbol is still open, so no new position was opened."
+                : "a manual trade is open on this symbol, so the bot left it alone and opened nothing.";
         }
         else if (spotSellSignal && !AllowSpotSellWithoutPosition)
         {
@@ -522,7 +526,7 @@ public sealed class AutoTradeService : BackgroundService
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 timeoutCts.CancelAfter(MarketDataTimeout);
 
-                return await marketData.GetCandlesAsync(brokerName, symbol, timeframe, useFutures, CandleLimit, isTestnet);
+                return await marketData.GetCandlesAsync(brokerName, symbol, timeframe, useFutures, CandleLimit, isTestnet).WaitAsync(timeoutCts.Token);
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
@@ -666,8 +670,19 @@ public sealed class AutoTradeService : BackgroundService
         {
             foreach (var orphan in orphanTrades)
             {
-                orphan.Status = "Cancelled";
-                orphan.Reason = "Order never reached the exchange; expired automatically.";
+                // A crash/redeploy between "reserve" and "exchange answered" can leave a live order
+                // on the exchange that we never recorded. Let the recovery job look it up by client
+                // order id before releasing the trade; only trades without a key are cancelled outright.
+                if (!string.IsNullOrWhiteSpace(orphan.IdempotencyKey))
+                {
+                    orphan.Status = "PendingReconciliation";
+                    orphan.Reason = "No exchange record after 1 hour; checking the exchange by client order id before releasing.";
+                }
+                else
+                {
+                    orphan.Status = "Cancelled";
+                    orphan.Reason = "Order never reached the exchange; expired automatically.";
+                }
                 orphan.UpdatedAt = now;
             }
             await db.SaveChangesAsync(cancellationToken);
@@ -696,6 +711,8 @@ public sealed class AutoTradeService : BackgroundService
                 catch (Exception ex) { _logger.LogError(ex, "Unknown-submission recovery failed for user {UserId}; other users will continue.", unresolvedUserId); }
             }
         }
+
+        await EscalateUnprotectedTradesAsync(scope.ServiceProvider, db, now, cancellationToken);
 
         var protectionRetryCutoff = now.AddHours(-24);
         var userIds = await db.ExchangeOrders
@@ -729,6 +746,74 @@ public sealed class AutoTradeService : BackgroundService
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (Exception ex) { _logger.LogError(ex, "Scheduled reconciliation failed for user {UserId}; other users will continue.", userId); }
+        }
+    }
+
+    // SL/TP that still cannot be placed after this long is treated as failed: stop retrying,
+    // exit at market (a position with no protection is worse than a small loss) and tell the user.
+    private static readonly TimeSpan ProtectionGracePeriod = TimeSpan.FromMinutes(15);
+
+    private async Task EscalateUnprotectedTradesAsync(IServiceProvider services, ApplicationDbContext db, DateTime now, CancellationToken cancellationToken)
+    {
+        var cutoff = now - ProtectionGracePeriod;
+
+        var stuckTrades = await db.Trades
+            .Include(t => t.User)
+            .Where(t => t.Status == "Open" && t.ProtectionStatus == "ProtectionPending" && t.EntryTime < cutoff)
+            .ToListAsync(cancellationToken);
+
+        if (stuckTrades.Count == 0) return;
+
+        var brokerService = services.GetRequiredService<BrokerService>();
+
+        foreach (var trade in stuckTrades)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var connection = await db.BrokerConnections.FirstOrDefaultAsync(
+                    c => c.UserId == trade.UserId && c.BrokerName == trade.BrokerName && c.IsConnected, cancellationToken);
+
+                var isFutures = await db.ExchangeOrders.AsNoTracking()
+                    .Where(o => o.TradeId == trade.Id && o.OrderRole == "Entry")
+                    .Select(o => o.IsFutures)
+                    .FirstOrDefaultAsync(cancellationToken);
+
+                var outcome = "no connected broker was available to exit the position";
+                var exited = false;
+
+                if (connection != null)
+                {
+                    var exit = await brokerService.ClosePositionAsync(trade.UserId, trade.Id, connection, isFutures);
+                    exited = exit.Success;
+                    outcome = exit.Success ? "a market exit was submitted" : $"the market exit failed: {exit.Error}";
+                }
+
+                // Stop the retry loop; the user has been told and can act manually.
+                if (!exited && string.Equals(trade.Status, "Open", StringComparison.OrdinalIgnoreCase))
+                {
+                    trade.ProtectionStatus = "ProtectionFailed";
+                    trade.UpdatedAt = now;
+                }
+
+                await WriteAuditAsync(db, trade.UserId, "ProtectionEscalated",
+                    $"Trade {trade.Id} ({trade.Symbol}) still had no SL/TP after {ProtectionGracePeriod.TotalMinutes:F0} minutes; {outcome}.",
+                    cancellationToken);
+
+                _logger.LogWarning("Trade {TradeId} ({Symbol}) had no protection after {Minutes} min: {Outcome}.",
+                    trade.Id, trade.Symbol, ProtectionGracePeriod.TotalMinutes, outcome);
+
+                if (trade.User?.TelegramChatId is long chatId)
+                {
+                    await _telegram.SendAlertAsync(chatId,
+                        $"⚠️ {trade.Symbol}: your stop-loss/take-profit could not be placed for {ProtectionGracePeriod.TotalMinutes:F0} minutes, so {outcome}. Please check your open positions.");
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Escalation failed for trade {TradeId}; other trades will continue.", trade.Id);
+            }
         }
     }
 
