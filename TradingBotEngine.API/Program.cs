@@ -218,6 +218,28 @@ BinanceEnvironments.UseDemoTrading = builder.Configuration.GetValue<bool>("Binan
 var app = builder.Build();
 
 app.UseForwardedHeaders();
+
+// Self-heal: the code expects this column, but a database created from older migrations may not
+// have it, which makes every broker-connection query (including the bot worker) fail.
+// "IF NOT EXISTS" makes this safe to run on every start.
+try
+{
+    var schemaConnectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+    if (!string.IsNullOrWhiteSpace(schemaConnectionString))
+    {
+        using var schemaConnection = new Npgsql.NpgsqlConnection(schemaConnectionString);
+        schemaConnection.Open();
+        using var schemaCommand = new Npgsql.NpgsqlCommand(
+            "ALTER TABLE \"BrokerConnections\" ADD COLUMN IF NOT EXISTS \"IsFutures\" boolean NOT NULL DEFAULT false;",
+            schemaConnection);
+        schemaCommand.ExecuteNonQuery();
+        app.Logger.LogInformation("Schema check done: BrokerConnections.IsFutures is present.");
+    }
+}
+catch (Exception schemaException)
+{
+    app.Logger.LogError(schemaException, "Schema self-heal for BrokerConnections.IsFutures failed.");
+}
 app.UseExceptionHandler();
 
 if (!dataProtectionPersisted && !app.Environment.IsDevelopment())
@@ -245,4 +267,4 @@ app.MapHub<TradingHub>("/tradingHub");
 
 app.Run();
 
-public partial class Program { }
+public partial class Program { }    
