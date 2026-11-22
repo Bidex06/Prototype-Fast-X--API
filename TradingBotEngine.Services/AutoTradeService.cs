@@ -234,14 +234,16 @@ public sealed class AutoTradeService : BackgroundService
                 {
                     _logger.LogWarning("Bot {BotId} reached 5 consecutive API errors. Auto-shutting down.", bot.Id);
                     
+                    var lastError = ex.Message.Length > 300 ? ex.Message[..300] : ex.Message;
+
                     bot.IsRunning = false;
                     bot.UpdatedAt = DateTime.UtcNow;
                     
                     db.AuditLogs.Add(new AuditLog
                     {
                         UserId = bot.UserId,
-                        Action = "BotAutoShutdown",
-                        Details = $"Bot '{bot.Name}' was stopped automatically due to 5 consecutive API errors.",
+                        Action = "AutoTradeBotShutdown",
+                        Details = $"Bot {bot.Id} ('{bot.Name}') was stopped automatically after 5 consecutive errors. Last error on {trackedSymbol.Symbol}: {lastError}",
                         CreatedAt = DateTime.UtcNow
                     });
                     await db.SaveChangesAsync(cancellationToken);
@@ -249,7 +251,7 @@ public sealed class AutoTradeService : BackgroundService
                     // Optional: send Telegram alert
                     if (bot.User.TelegramChatId.HasValue)
                     {
-                        await _telegram.SendAlertAsync(bot.User.TelegramChatId.Value, $"⚠️ Bot '{bot.Name}' has been SHUT DOWN automatically due to 5 repeated API errors. Please check your broker connection.");
+                        await _telegram.SendAlertAsync(bot.User.TelegramChatId.Value, $"⚠️ Bot '{bot.Name}' was SHUT DOWN automatically after 5 repeated errors on {trackedSymbol.Symbol}. Last error: {lastError}");
                     }
 
                     _consecutiveApiErrors[bot.Id] = 0; // Reset after shutdown

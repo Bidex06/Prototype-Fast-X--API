@@ -63,14 +63,31 @@ public sealed class ExchangeMarketDataService
         bool useFutures,
         bool isTestnet = true)
     {
+        try
+        {
+            return await GetBinanceRulesCoreAsync(symbol, useFutures, BinanceEnvironments.ForTrading(isTestnet));
+        }
+        catch (Exception) when (isTestnet && BinanceEnvironments.UseDemoTrading)
+        {
+            // Order rules and prices are public data. If the Demo servers cannot answer,
+            // the live servers give the same rules, so a bot order is not lost over it.
+            return await GetBinanceRulesCoreAsync(symbol, useFutures, BinanceEnvironment.Live);
+        }
+    }
+
+    private async Task<ExchangeOrderRules> GetBinanceRulesCoreAsync(
+        string symbol,
+        bool useFutures,
+        BinanceEnvironment environment)
+    {
         if (string.IsNullOrWhiteSpace(symbol))
             throw new ArgumentException("Symbol is required.", nameof(symbol));
 
         symbol = symbol.Trim().ToUpperInvariant();
-        
+
         var client = new BinanceRestClient(options =>
         {
-            options.Environment = BinanceEnvironments.ForTrading(isTestnet);
+            options.Environment = environment;
         });
 
         if (useFutures)
@@ -302,11 +319,25 @@ public sealed class ExchangeMarketDataService
 
     private static async Task<IReadOnlyList<Candle>> GetBinanceCandlesAsync(string symbol, string timeframe, bool useFutures, int limit, bool isTestnet)
     {
+        try
+        {
+            return await FetchBinanceCandlesAsync(symbol, timeframe, useFutures, limit, BinanceEnvironments.ForMarketData(isTestnet));
+        }
+        catch (Exception) when (isTestnet && BinanceEnvironments.UseDemoTrading)
+        {
+            // Demo mode normally reads candles from Binance's live public servers. If those cannot be
+            // reached (region block, timeout), read them from the Demo servers instead.
+            return await FetchBinanceCandlesAsync(symbol, timeframe, useFutures, limit, BinanceEnvironments.ForTrading(isTestnet));
+        }
+    }
+
+    private static async Task<IReadOnlyList<Candle>> FetchBinanceCandlesAsync(string symbol, string timeframe, bool useFutures, int limit, BinanceEnvironment environment)
+    {
         var interval = ParseBinanceInterval(timeframe);
-        
+
         var client = new BinanceRestClient(options =>
         {
-            options.Environment = BinanceEnvironments.ForMarketData(isTestnet);
+            options.Environment = environment;
         });
 
         if (useFutures)
