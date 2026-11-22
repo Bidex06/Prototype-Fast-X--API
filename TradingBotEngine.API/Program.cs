@@ -230,10 +230,12 @@ try
         using var schemaConnection = new Npgsql.NpgsqlConnection(schemaConnectionString);
         schemaConnection.Open();
         using var schemaCommand = new Npgsql.NpgsqlCommand(
-            "ALTER TABLE \"BrokerConnections\" ADD COLUMN IF NOT EXISTS \"IsFutures\" boolean NOT NULL DEFAULT false;",
+            "ALTER TABLE \"BrokerConnections\" ADD COLUMN IF NOT EXISTS \"IsFutures\" boolean NOT NULL DEFAULT false; " +
+            "ALTER TABLE \"BrokerConnections\" ADD COLUMN IF NOT EXISTS \"EquityHighWaterMark\" numeric NOT NULL DEFAULT 0; " +
+            "ALTER TABLE \"BrokerConnections\" ADD COLUMN IF NOT EXISTS \"EquityHighWaterMarkUpdatedAt\" timestamp with time zone NULL;",
             schemaConnection);
         schemaCommand.ExecuteNonQuery();
-        app.Logger.LogInformation("Schema check done: BrokerConnections.IsFutures is present.");
+        app.Logger.LogInformation("Schema check done: BrokerConnections columns are present.");
     }
 }
 catch (Exception schemaException)
@@ -267,4 +269,4 @@ app.MapHub<TradingHub>("/tradingHub");
 
 app.Run();
 
-public partial class Program { }    
+public partial class Program { }

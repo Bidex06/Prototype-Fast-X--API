@@ -88,8 +88,8 @@ public class BrokerServiceMaxDrawdownTests
             idempotencyKey: "max-drawdown-test-001");
 
         result.Success.Should().BeFalse();
-        result.Error.Should().Be(
-            "Maximum drawdown limit reached (10.00%).");
+        result.Error.Should().StartWith(
+            "Maximum drawdown limit reached (10.00%)");
 
         var auditLog = await context.AuditLogs
             .SingleOrDefaultAsync(a =>

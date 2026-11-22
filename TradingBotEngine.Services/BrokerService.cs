@@ -96,6 +96,9 @@ namespace TradingBotEngine.Services
 
                 persisted.UpdatedAt = DateTime.UtcNow;
 
+                if (connected)
+                    await ResetEquityBaselineAsync(userId, persisted.Id);
+
                 _context.AuditLogs.Add(new AuditLog
                 {
                     UserId = userId,
@@ -303,6 +306,8 @@ namespace TradingBotEngine.Services
             }
 
             connection.UpdatedAt = DateTime.UtcNow;
+
+            await ResetEquityBaselineAsync(userId, connection.Id);
 
             _context.AuditLogs.Add(new AuditLog
             {
@@ -877,29 +882,22 @@ namespace TradingBotEngine.Services
                     $"Order for '{symbol}' was blocked because risk settings are not configured for user {userId}.");
             }
 
-            if (trackedRiskSetting.EquityHighWaterMark <= 0m)
-            {
-                trackedRiskSetting.EquityHighWaterMark = currentEquity;
-                trackedRiskSetting.EquityHighWaterMarkUpdatedAt =
-                    DateTime.UtcNow;
-
-                await _context.SaveChangesAsync();
-            }
-            else if (currentEquity > trackedRiskSetting.EquityHighWaterMark)
-            {
-                trackedRiskSetting.EquityHighWaterMark = currentEquity;
-                trackedRiskSetting.EquityHighWaterMarkUpdatedAt =
-                    DateTime.UtcNow;
-
-                await _context.SaveChangesAsync();
-            }
-
+            // The peak-equity baseline is kept per broker connection (account), not per user,
+            // so switching accounts/environments or using two brokers cannot trip the guard.
             var equityHighWaterMark =
-                trackedRiskSetting.EquityHighWaterMark;
+                await GetEquityBaselineAsync(connection, trackedRiskSetting);
+
+            if (equityHighWaterMark <= 0m || currentEquity > equityHighWaterMark)
+            {
+                equityHighWaterMark = currentEquity;
+                await SetEquityBaselineAsync(connection, trackedRiskSetting, currentEquity);
+                await _context.SaveChangesAsync();
+            }
 
             var drawdownPercentage =
-                ((equityHighWaterMark - currentEquity) /
-                 equityHighWaterMark) * 100m;
+                equityHighWaterMark > 0m
+                    ? ((equityHighWaterMark - currentEquity) / equityHighWaterMark) * 100m
+                    : 0m;
 
             if (drawdownPercentage >= trackedRiskSetting.MaxDrawdown)
             {
@@ -921,7 +919,10 @@ namespace TradingBotEngine.Services
 
                 return BrokerOrderResult.Fail(
                     $"Maximum drawdown limit reached " +
-                    $"({trackedRiskSetting.MaxDrawdown:F2}%).");
+                    $"({trackedRiskSetting.MaxDrawdown:F2}%). " +
+                    $"Equity {currentEquity:F2} USDT is down {drawdownPercentage:F2}% from this account's " +
+                    $"peak of {equityHighWaterMark:F2} USDT. If you switched accounts or environments, " +
+                    "disconnect and reconnect your broker to reset the baseline.");
             }
 
             ExchangeOrderRules rules;
@@ -3230,6 +3231,76 @@ namespace TradingBotEngine.Services
             });
 
             await _context.SaveChangesAsync();
+        }
+
+        // ---- Peak-equity baseline, stored per broker connection ----
+        // New columns BrokerConnections.EquityHighWaterMark / EquityHighWaterMarkUpdatedAt are created at
+        // startup (Program.cs) and accessed with plain SQL, so no EF model change or migration is needed.
+        // In-memory databases (unit tests) and any failure fall back to the old per-user value.
+        private async Task<decimal> GetEquityBaselineAsync(BrokerConnection connection, RiskSetting riskSetting)
+        {
+            if (!_context.Database.IsRelational())
+                return riskSetting.EquityHighWaterMark;
+
+            try
+            {
+                var rows = await _context.Database
+                    .SqlQuery<decimal>($"SELECT \"EquityHighWaterMark\" AS \"Value\" FROM \"BrokerConnections\" WHERE \"Id\" = {connection.Id}")
+                    .ToListAsync();
+
+                return rows.FirstOrDefault();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[RiskBaseline] Per-connection baseline unavailable, using the per-user value: {ex.Message}");
+                return riskSetting.EquityHighWaterMark;
+            }
+        }
+
+        private async Task SetEquityBaselineAsync(BrokerConnection connection, RiskSetting riskSetting, decimal value)
+        {
+            var now = DateTime.UtcNow;
+
+            // Legacy per-user copy: used by the fallback path and kept in step.
+            riskSetting.EquityHighWaterMark = value;
+            riskSetting.EquityHighWaterMarkUpdatedAt = now;
+
+            if (!_context.Database.IsRelational())
+                return;
+
+            try
+            {
+                await _context.Database.ExecuteSqlInterpolatedAsync(
+                    $"UPDATE \"BrokerConnections\" SET \"EquityHighWaterMark\" = {value}, \"EquityHighWaterMarkUpdatedAt\" = {now} WHERE \"Id\" = {connection.Id}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[RiskBaseline] Could not save the per-connection baseline: {ex.Message}");
+            }
+        }
+
+        // Called when the account behind a connection changes (new keys, Testnet/Demo/Live switch).
+        private async Task ResetEquityBaselineAsync(int userId, int connectionId)
+        {
+            var riskSetting = await _context.RiskSettings.FirstOrDefaultAsync(r => r.UserId == userId);
+            if (riskSetting != null)
+            {
+                riskSetting.EquityHighWaterMark = 0m;
+                riskSetting.EquityHighWaterMarkUpdatedAt = null;
+            }
+
+            if (!_context.Database.IsRelational() || connectionId <= 0)
+                return;
+
+            try
+            {
+                await _context.Database.ExecuteSqlInterpolatedAsync(
+                    $"UPDATE \"BrokerConnections\" SET \"EquityHighWaterMark\" = 0, \"EquityHighWaterMarkUpdatedAt\" = NULL WHERE \"Id\" = {connectionId}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[RiskBaseline] Could not reset the per-connection baseline: {ex.Message}");
+            }
         }
 
         private static string ExtractBaseAsset(string symbol)
