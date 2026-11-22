@@ -792,6 +792,16 @@ namespace TradingBotEngine.Services
 
             var equityBalance = balance + openSpotCostBasis;
 
+            // Best source for spot equity is the exchange itself: every asset's free + locked amount
+            // valued in USDT. Unlike the database rows above (a fresh market buy is saved with entry
+            // price 0 and status "Pending" until reconciliation runs), this always counts open positions.
+            if (!useFutures && string.Equals(connection.BrokerName, "Binance", StringComparison.OrdinalIgnoreCase))
+            {
+                var exchangeEquity = await TryGetBinanceSpotEquityAsync(connection);
+                if (exchangeEquity.HasValue && exchangeEquity.Value > 0m)
+                    equityBalance = exchangeEquity.Value;
+            }
+
             var utcToday = DateTime.UtcNow.Date;
             var tomorrowUtc = utcToday.AddDays(1);
 
@@ -1365,26 +1375,30 @@ namespace TradingBotEngine.Services
                     {
                         await EnsureFuturesAccountSettingsAsync(binance, symbol, riskSetting.Leverage);
 
-                        var result =
-                            await binance
-                                .UsdFuturesApi
-                                .Trading
-                                .PlaceOrderAsync(
-                                    symbol: symbol,
-                                    side: side,
+                        // Entry only. A market order takes no price; a limit order needs a price and a time-in-force.
+                        // Stop-loss / take-profit are NOT sent with the entry (Binance rejects a stop price on a
+                        // plain entry with -1106): they are placed as separate reduce-only orders once the entry
+                        // fills (see TryEnsureProtectionAsync).
+                        var isFuturesMarketOrder = string.Equals(
+                            orderType,
+                            "Market",
+                            StringComparison.OrdinalIgnoreCase);
 
-                                    type:
-                                        string.Equals(
-                                            orderType,
-                                            "Market",
-                                            StringComparison.OrdinalIgnoreCase)
-                                            ? FuturesOrderType.Market
-                                            : FuturesOrderType.Limit,
-
-                                    quantity: quantity,
-                                    price: entryPrice,
-                                    newClientOrderId: clientOrderId,
-                                    stopPrice: stopLoss);
+                        var result = isFuturesMarketOrder
+                            ? await binance.UsdFuturesApi.Trading.PlaceOrderAsync(
+                                symbol: symbol,
+                                side: side,
+                                type: FuturesOrderType.Market,
+                                quantity: quantity,
+                                newClientOrderId: clientOrderId)
+                            : await binance.UsdFuturesApi.Trading.PlaceOrderAsync(
+                                symbol: symbol,
+                                side: side,
+                                type: FuturesOrderType.Limit,
+                                quantity: quantity,
+                                price: entryPrice,
+                                timeInForce: TimeInForce.GoodTillCanceled,
+                                newClientOrderId: clientOrderId);
 
                         if (!result.Success)
                         {
@@ -2603,6 +2617,50 @@ namespace TradingBotEngine.Services
                             trade.TakeProfit = RoundToStep(trade.TakeProfit.Value, futuresTick.Value);
                     }
 
+                    // Binance rejects a stop / take-profit that would trigger immediately (-2021).
+                    // If the price has already crossed one of the levels, exit at market now instead.
+                    var futuresLast = await binance.UsdFuturesApi.ExchangeData.GetPriceAsync(trade.Symbol);
+                    if (futuresLast.Success && futuresLast.Data != null)
+                    {
+                        var futuresPrice = futuresLast.Data.Price;
+                        var isLongPosition = protectionSide == OrderSide.Sell;
+
+                        var futuresStopCrossed = trade.StopLoss.HasValue &&
+                            (isLongPosition ? futuresPrice <= trade.StopLoss.Value : futuresPrice >= trade.StopLoss.Value);
+                        var futuresTargetCrossed = trade.TakeProfit.HasValue &&
+                            (isLongPosition ? futuresPrice >= trade.TakeProfit.Value : futuresPrice <= trade.TakeProfit.Value);
+
+                        if (futuresStopCrossed || futuresTargetCrossed)
+                        {
+                            var futuresExitReason = futuresTargetCrossed
+                                ? $"market price {futuresPrice} has already reached the take-profit {trade.TakeProfit!.Value}"
+                                : $"market price {futuresPrice} has already reached the stop-loss {trade.StopLoss!.Value}";
+
+                            _context.AuditLogs.Add(new AuditLog
+                            {
+                                UserId = trade.UserId,
+                                Action = "ProtectionSkippedExitNow",
+                                Details = LimitLength(
+                                    $"Trade {trade.Id} ({trade.Symbol}): futures protection not placed because {futuresExitReason}. Closing at market instead.",
+                                    1000),
+                                CreatedAt = DateTime.UtcNow
+                            });
+                            await _context.SaveChangesAsync();
+
+                            var futuresExit = await ClosePositionAsync(trade.UserId, trade.Id, connection, true);
+                            if (!futuresExit.Success)
+                            {
+                                trade.ProtectionStatus = "ProtectionPending";
+                                trade.Reason = LimitLength(
+                                    $"Futures protection not placed ({futuresExitReason}) and the market exit failed: {futuresExit.Error}", 480);
+                                trade.UpdatedAt = DateTime.UtcNow;
+                                await _context.SaveChangesAsync();
+                            }
+
+                            return futuresExit.Success;
+                        }
+                    }
+
                     if (trade.StopLoss.HasValue && string.IsNullOrWhiteSpace(trade.StopLossOrderId))
                     {
                         var stop = await binance.UsdFuturesApi.Trading.PlaceOrderAsync(
@@ -3231,6 +3289,59 @@ namespace TradingBotEngine.Services
             });
 
             await _context.SaveChangesAsync();
+        }
+
+        private static bool IsUsdStableAsset(string asset) =>
+            asset is "USDT" or "USDC" or "BUSD" or "FDUSD" or "TUSD" or "USDP";
+
+        // Total Binance spot equity in USDT, read from the exchange. Returns null on any failure
+        // so the caller falls back to the database-based estimate.
+        private async Task<decimal?> TryGetBinanceSpotEquityAsync(BrokerConnection connection)
+        {
+            try
+            {
+                if (CreateClient(connection) is not BinanceRestClient binance)
+                    return null;
+
+                var account = await binance.SpotApi.Account.GetAccountInfoAsync();
+                if (!account.Success || account.Data == null)
+                    return null;
+
+                var held = account.Data.Balances.Where(x => x.Total > 0m).ToList();
+                if (held.Count == 0)
+                    return 0m;
+
+                var prices = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
+                if (held.Any(x => !IsUsdStableAsset(x.Asset)))
+                {
+                    var priceResult = await binance.SpotApi.ExchangeData.GetPricesAsync();
+                    if (!priceResult.Success || priceResult.Data == null)
+                        return null;
+
+                    foreach (var price in priceResult.Data)
+                        prices[price.Symbol] = price.Price;
+                }
+
+                var total = 0m;
+                foreach (var holding in held)
+                {
+                    if (IsUsdStableAsset(holding.Asset))
+                    {
+                        total += holding.Total;
+                        continue;
+                    }
+
+                    if (prices.TryGetValue(holding.Asset + "USDT", out var usdtPrice))
+                        total += holding.Total * usdtPrice;
+                }
+
+                return total;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[RiskEquity] Could not read total spot equity from Binance: {ex.Message}");
+                return null;
+            }
         }
 
         // ---- Peak-equity baseline, stored per broker connection ----
