@@ -232,7 +232,9 @@ try
         using var schemaCommand = new Npgsql.NpgsqlCommand(
             "ALTER TABLE \"BrokerConnections\" ADD COLUMN IF NOT EXISTS \"IsFutures\" boolean NOT NULL DEFAULT false; " +
             "ALTER TABLE \"BrokerConnections\" ADD COLUMN IF NOT EXISTS \"EquityHighWaterMark\" numeric NOT NULL DEFAULT 0; " +
-            "ALTER TABLE \"BrokerConnections\" ADD COLUMN IF NOT EXISTS \"EquityHighWaterMarkUpdatedAt\" timestamp with time zone NULL;",
+            "ALTER TABLE \"BrokerConnections\" ADD COLUMN IF NOT EXISTS \"EquityHighWaterMarkUpdatedAt\" timestamp with time zone NULL; " +
+            "ALTER TABLE \"BrokerConnections\" ADD COLUMN IF NOT EXISTS \"FuturesEquityHighWaterMark\" numeric NOT NULL DEFAULT 0; " +
+            "ALTER TABLE \"BrokerConnections\" ADD COLUMN IF NOT EXISTS \"FuturesEquityHighWaterMarkUpdatedAt\" timestamp with time zone NULL;",
             schemaConnection);
         schemaCommand.ExecuteNonQuery();
         app.Logger.LogInformation("Schema check done: BrokerConnections columns are present.");

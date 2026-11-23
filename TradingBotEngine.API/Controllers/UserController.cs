@@ -36,7 +36,8 @@ public class UserController : ControllerBase
 
         if (user == null) return NotFound(new { message = "User not found." });
 
-        var subscriptionActive = user.Subscription != null && user.Subscription.IsActive && user.Subscription.EndDate > DateTime.UtcNow;
+        // FIXED: Use the SubscriptionGuard so Admins always show as active on the frontend
+        var subscriptionActive = SubscriptionGuard.HasActiveSubscription(user);
 
         return Ok(new UserProfileResponseDto
         {
@@ -66,7 +67,8 @@ public class UserController : ControllerBase
         if (user == null) return NotFound(new { message = "User not found." });
         if (!user.IsActive) return BadRequest(new { message = "Account is deactivated." });
 
-        if (request.IsAutoTradeEnabled && (user.Subscription == null || !user.Subscription.IsActive || user.Subscription.EndDate <= DateTime.UtcNow))
+        // FIXED: Replaced the manual date check with SubscriptionGuard so Admins can always toggle this
+        if (request.IsAutoTradeEnabled && !SubscriptionGuard.HasActiveSubscription(user))
             return BadRequest(new { message = "An active subscription is required before enabling auto-trade." });
 
         user.IsAutoTradeEnabled = request.IsAutoTradeEnabled;
@@ -240,4 +242,4 @@ public class UserController : ControllerBase
     {
         return int.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out userId);
     }
-} 
+}      

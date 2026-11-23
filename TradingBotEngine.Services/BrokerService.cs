@@ -895,12 +895,12 @@ namespace TradingBotEngine.Services
             // The peak-equity baseline is kept per broker connection (account), not per user,
             // so switching accounts/environments or using two brokers cannot trip the guard.
             var equityHighWaterMark =
-                await GetEquityBaselineAsync(connection, trackedRiskSetting);
+                await GetEquityBaselineAsync(connection, trackedRiskSetting, useFutures);
 
             if (equityHighWaterMark <= 0m || currentEquity > equityHighWaterMark)
             {
                 equityHighWaterMark = currentEquity;
-                await SetEquityBaselineAsync(connection, trackedRiskSetting, currentEquity);
+                await SetEquityBaselineAsync(connection, trackedRiskSetting, currentEquity, useFutures);
                 await _context.SaveChangesAsync();
             }
 
@@ -2753,6 +2753,10 @@ namespace TradingBotEngine.Services
 
                 if (resolvedProtect.Problem != null)
                 {
+                    // Coins locked in other orders usually means the protection already exists on the exchange.
+                    if (await TryAdoptExistingSpotProtectionAsync(trade, connection, binance, parent.Id, protectQuantity))
+                        return true;
+
                     trade.ProtectionStatus = "ProtectionPending";
                     trade.Reason = LimitLength($"Protection not placed: {resolvedProtect.Problem}", 480);
                     trade.UpdatedAt = DateTime.UtcNow;
@@ -2853,6 +2857,9 @@ namespace TradingBotEngine.Services
                     parent.Id,
                     oco.Data,
                     binance);
+
+                if (!persistedProtection)
+                    persistedProtection = await TryAdoptExistingSpotProtectionAsync(trade, connection, binance, parent.Id, protectQuantity);
 
                 if (!persistedProtection)
                 {
@@ -3069,6 +3076,69 @@ namespace TradingBotEngine.Services
                     "LimitMaker",
                     parentExchangeOrderId);
 
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // The protection (stop-loss + take-profit OCO) can already exist on Binance even though the app
+        // never recorded it (e.g. the OCO was accepted but saving its two legs failed). The coins are then
+        // locked, every retry fails, and the app wrongly thinks the position is unprotected. Find the two
+        // open SELL orders for the symbol and record them as this trade's protection.
+        private async Task<bool> TryAdoptExistingSpotProtectionAsync(
+            Trade trade,
+            BrokerConnection connection,
+            BinanceRestClient binance,
+            int parentExchangeOrderId,
+            decimal positionQuantity)
+        {
+            try
+            {
+                var open = await binance.SpotApi.Trading.GetOpenOrdersAsync(trade.Symbol);
+                if (!open.Success || open.Data == null)
+                    return false;
+
+                var sells = open.Data.Where(o => o.Side == OrderSide.Sell).ToList();
+                if (sells.Count < 2)
+                    return false;
+
+                // Both OCO legs carry the full position quantity.
+                if (sells.Max(o => o.Quantity) < positionQuantity * 0.90m)
+                    return false;
+
+                var stopLeg = sells.FirstOrDefault(o =>
+                    o.Type.ToString().Contains("Stop", StringComparison.OrdinalIgnoreCase));
+                var targetLeg = sells.FirstOrDefault(o =>
+                    !o.Type.ToString().Contains("Stop", StringComparison.OrdinalIgnoreCase) &&
+                    o.Type.ToString().Contains("Limit", StringComparison.OrdinalIgnoreCase));
+
+                if (stopLeg == null || targetLeg == null)
+                    return false;
+
+                trade.StopLossOrderId = stopLeg.Id.ToString();
+                trade.TakeProfitOrderId = targetLeg.Id.ToString();
+
+                await PersistExchangeOrderIfMissingAsync(
+                    trade, connection, trade.StopLossOrderId, "SELL", "StopLoss", "StopLossLimit", parentExchangeOrderId);
+                await PersistExchangeOrderIfMissingAsync(
+                    trade, connection, trade.TakeProfitOrderId, "SELL", "TakeProfit", "LimitMaker", parentExchangeOrderId);
+
+                trade.ProtectionStatus = "Protected";
+                trade.Reason = null;
+                trade.UpdatedAt = DateTime.UtcNow;
+
+                _context.AuditLogs.Add(new AuditLog
+                {
+                    UserId = trade.UserId,
+                    Action = "ProtectionOrdersAdopted",
+                    Details = $"Trade {trade.Id} ({trade.Symbol}): found existing SL/TP orders on Binance and recorded them. SL={trade.StopLossOrderId}, TP={trade.TakeProfitOrderId}.",
+                    CreatedAt = DateTime.UtcNow
+                });
+
+                await _context.SaveChangesAsync();
                 return true;
             }
             catch
@@ -3344,20 +3414,25 @@ namespace TradingBotEngine.Services
             }
         }
 
-        // ---- Peak-equity baseline, stored per broker connection ----
-        // New columns BrokerConnections.EquityHighWaterMark / EquityHighWaterMarkUpdatedAt are created at
-        // startup (Program.cs) and accessed with plain SQL, so no EF model change or migration is needed.
-        // In-memory databases (unit tests) and any failure fall back to the old per-user value.
-        private async Task<decimal> GetEquityBaselineAsync(BrokerConnection connection, RiskSetting riskSetting)
+        // ---- Peak-equity baseline: per broker connection AND market (spot vs futures) ----
+        // A Binance connection has two separate wallets (spot and futures) with different balances, so each
+        // gets its own baseline. The columns are created at startup (Program.cs) and accessed with plain SQL,
+        // so no EF model change or migration is needed. In-memory databases (unit tests) and any failure
+        // fall back to the old per-user value.
+        private async Task<decimal> GetEquityBaselineAsync(BrokerConnection connection, RiskSetting riskSetting, bool useFutures)
         {
             if (!_context.Database.IsRelational())
                 return riskSetting.EquityHighWaterMark;
 
             try
             {
-                var rows = await _context.Database
-                    .SqlQuery<decimal>($"SELECT \"EquityHighWaterMark\" AS \"Value\" FROM \"BrokerConnections\" WHERE \"Id\" = {connection.Id}")
-                    .ToListAsync();
+                var rows = useFutures
+                    ? await _context.Database
+                        .SqlQuery<decimal>($"SELECT \"FuturesEquityHighWaterMark\" AS \"Value\" FROM \"BrokerConnections\" WHERE \"Id\" = {connection.Id}")
+                        .ToListAsync()
+                    : await _context.Database
+                        .SqlQuery<decimal>($"SELECT \"EquityHighWaterMark\" AS \"Value\" FROM \"BrokerConnections\" WHERE \"Id\" = {connection.Id}")
+                        .ToListAsync();
 
                 return rows.FirstOrDefault();
             }
@@ -3368,7 +3443,7 @@ namespace TradingBotEngine.Services
             }
         }
 
-        private async Task SetEquityBaselineAsync(BrokerConnection connection, RiskSetting riskSetting, decimal value)
+        private async Task SetEquityBaselineAsync(BrokerConnection connection, RiskSetting riskSetting, decimal value, bool useFutures)
         {
             var now = DateTime.UtcNow;
 
@@ -3381,8 +3456,16 @@ namespace TradingBotEngine.Services
 
             try
             {
-                await _context.Database.ExecuteSqlInterpolatedAsync(
-                    $"UPDATE \"BrokerConnections\" SET \"EquityHighWaterMark\" = {value}, \"EquityHighWaterMarkUpdatedAt\" = {now} WHERE \"Id\" = {connection.Id}");
+                if (useFutures)
+                {
+                    await _context.Database.ExecuteSqlInterpolatedAsync(
+                        $"UPDATE \"BrokerConnections\" SET \"FuturesEquityHighWaterMark\" = {value}, \"FuturesEquityHighWaterMarkUpdatedAt\" = {now} WHERE \"Id\" = {connection.Id}");
+                }
+                else
+                {
+                    await _context.Database.ExecuteSqlInterpolatedAsync(
+                        $"UPDATE \"BrokerConnections\" SET \"EquityHighWaterMark\" = {value}, \"EquityHighWaterMarkUpdatedAt\" = {now} WHERE \"Id\" = {connection.Id}");
+                }
             }
             catch (Exception ex)
             {
@@ -3406,7 +3489,7 @@ namespace TradingBotEngine.Services
             try
             {
                 await _context.Database.ExecuteSqlInterpolatedAsync(
-                    $"UPDATE \"BrokerConnections\" SET \"EquityHighWaterMark\" = 0, \"EquityHighWaterMarkUpdatedAt\" = NULL WHERE \"Id\" = {connectionId}");
+                    $"UPDATE \"BrokerConnections\" SET \"EquityHighWaterMark\" = 0, \"EquityHighWaterMarkUpdatedAt\" = NULL, \"FuturesEquityHighWaterMark\" = 0, \"FuturesEquityHighWaterMarkUpdatedAt\" = NULL WHERE \"Id\" = {connectionId}");
             }
             catch (Exception ex)
             {
