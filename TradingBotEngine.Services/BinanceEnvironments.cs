@@ -27,6 +27,15 @@ namespace TradingBotEngine.Services
                 null,
                 null);
 
+        // REST base URL of the USD-M futures server, for the few calls made without the library.
+        public static string FuturesRestBaseUrl(bool isTestnet)
+        {
+            if (!isTestnet)
+                return "https://fapi.binance.com";
+
+            return UseDemoTrading ? "https://demo-fapi.binance.com" : "https://testnet.binancefuture.com";
+        }
+
         // Used for orders, balances, positions and order rules.
         public static BinanceEnvironment ForTrading(bool isTestnet)
         {

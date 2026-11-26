@@ -138,6 +138,8 @@ public sealed class AutoTradeService : BackgroundService
         var signalGenerator = scope.ServiceProvider.GetRequiredService<SignalGenerator>();
         var brokerService = scope.ServiceProvider.GetRequiredService<BrokerService>();
 
+        await StopBotsAfterProtectionExitsAsync(db, DateTime.UtcNow, cancellationToken);
+
         var bots = await db.TradingBots
             .Include(b => b.User)
                 .ThenInclude(u => u.Subscription)
@@ -714,6 +716,17 @@ public sealed class AutoTradeService : BackgroundService
             }
         }
 
+        try
+        {
+            var futuresClosed = await scope.ServiceProvider.GetRequiredService<BrokerService>().SyncFuturesAlgoProtectionAsync();
+            if (futuresClosed > 0)
+                _logger.LogInformation("Booked {Count} futures trade(s) closed by their exchange stop-loss/take-profit.", futuresClosed);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Futures protection sync failed; it will retry next cycle.");
+        }
+
         await EscalateUnprotectedTradesAsync(scope.ServiceProvider, db, now, cancellationToken);
 
         var protectionRetryCutoff = now.AddHours(-24);
@@ -751,6 +764,81 @@ public sealed class AutoTradeService : BackgroundService
         }
     }
 
+    // A bot stops by itself when one of its trades is closed by its stop-loss or take-profit, and says
+    // exactly why (also in the bot's Activity list and by Telegram). Press Start to resume.
+    // Only exits that happened after the bot was last started count, so restarting it is not undone
+    // by an old trade.
+    private async Task StopBotsAfterProtectionExitsAsync(ApplicationDbContext db, DateTime now, CancellationToken cancellationToken)
+    {
+        if (!BrokerService.StopBotAfterProtectionExit)
+            return;
+
+        var since = now.AddHours(-1);
+
+        var exits = await db.Trades
+            .Include(t => t.User)
+            .Where(t =>
+                t.Status == "Closed" &&
+                t.ProtectionStatus == "Triggered" &&
+                t.BotId != null &&
+                t.ExitTime != null &&
+                t.ExitTime > since)
+            .OrderBy(t => t.ExitTime)
+            .ToListAsync(cancellationToken);
+
+        foreach (var trade in exits)
+        {
+            try
+            {
+                var bot = await db.TradingBots.FirstOrDefaultAsync(
+                    b => b.Id == trade.BotId && b.UserId == trade.UserId, cancellationToken);
+
+                if (bot == null || !bot.IsRunning)
+                    continue;
+
+                if (bot.LastStartedAt.HasValue && trade.ExitTime.HasValue && trade.ExitTime.Value < bot.LastStartedAt.Value)
+                    continue;
+
+                var tookProfit = trade.Reason != null &&
+                    trade.Reason.StartsWith("Take-profit", StringComparison.OrdinalIgnoreCase);
+
+                var kind = tookProfit ? "Take-profit" : "Stop-loss";
+                var level = tookProfit ? trade.TakeProfit : trade.StopLoss;
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
+
+                var pnlText = trade.ProfitLoss.HasValue
+                    ? trade.ProfitLoss.Value.ToString("+0.00;-0.00;0.00", inv) + " USDT (before fees)"
+                    : "not available";
+
+                var reason =
+                    $"{kind} hit on {trade.Symbol} ({trade.Direction}): entry {trade.EntryPrice.ToString("0.####", inv)}, " +
+                    $"{kind.ToLowerInvariant()} level {(level.HasValue ? level.Value.ToString("0.####", inv) : "n/a")}, " +
+                    $"exit {(trade.ExitPrice.HasValue ? trade.ExitPrice.Value.ToString("0.####", inv) : "n/a")}, P&L {pnlText}.";
+
+                bot.IsRunning = false;
+                bot.LastStoppedAt = now;
+                bot.UpdatedAt = now;
+
+                await WriteAuditAsync(db, trade.UserId, "AutoTradeBotStopped",
+                    $"Bot {bot.Id} ('{bot.Name}') stopped automatically: {reason} Press Start to resume.",
+                    cancellationToken);
+
+                _logger.LogInformation("Bot {BotId} stopped automatically: {Reason}", bot.Id, reason);
+
+                if (trade.User?.TelegramChatId is long chatId)
+                {
+                    await _telegram.SendAlertAsync(chatId,
+                        $"🛑 Bot '{bot.Name}' stopped automatically.\nReason: {reason}\nPress Start in the app to resume.");
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Could not stop the bot after trade {TradeId} hit its stop-loss/take-profit.", trade.Id);
+            }
+        }
+    }
+
     // SL/TP that still cannot be placed after this long is treated as failed: stop retrying,
     // exit at market (a position with no protection is worse than a small loss) and tell the user.
     private static readonly TimeSpan ProtectionGracePeriod = TimeSpan.FromMinutes(15);
@@ -781,6 +869,7 @@ public sealed class AutoTradeService : BackgroundService
                     .Select(o => o.IsFutures)
                     .FirstOrDefaultAsync(cancellationToken);
 
+                var protectionError = trade.Reason;
                 var outcome = "no connected broker was available to exit the position";
                 var exited = false;
 
@@ -808,7 +897,8 @@ public sealed class AutoTradeService : BackgroundService
                 if (trade.User?.TelegramChatId is long chatId)
                 {
                     await _telegram.SendAlertAsync(chatId,
-                        $"⚠️ {trade.Symbol}: your stop-loss/take-profit could not be placed for {ProtectionGracePeriod.TotalMinutes:F0} minutes, so {outcome}. Please check your open positions.");
+                        $"⚠️ {trade.Symbol}: your stop-loss/take-profit could not be placed for {ProtectionGracePeriod.TotalMinutes:F0} minutes, so {outcome}. Please check your open positions." +
+                        (string.IsNullOrWhiteSpace(protectionError) ? "" : $" Last protection error: {(protectionError.Length > 350 ? protectionError[..350] : protectionError)}"));
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
@@ -885,6 +975,7 @@ if (bot.User.Role != "Admin" && (subscription == null || !subscription.IsActive 
         if (!broker.IsConnected) return BotEligibilityResult.Blocked("assigned broker connection is not connected");
         if (!IsSupportedBroker(broker.BrokerName)) return BotEligibilityResult.Blocked($"unsupported broker '{broker.BrokerName}'");
         if (!broker.IsTestnet && !broker.IsLiveTradingEnabled) return BotEligibilityResult.Blocked("live trading is not explicitly enabled for the assigned broker connection");
+        if (!broker.IsTestnet && !BrokerService.AllowLiveTrading) return BotEligibilityResult.Blocked("live trading is switched off on the server (Trading:AllowLive)");
 
         if (bot.TrackedSymbols == null || bot.TrackedSymbols.Count == 0) return BotEligibilityResult.Blocked("bot has no tracked symbols assigned");
 

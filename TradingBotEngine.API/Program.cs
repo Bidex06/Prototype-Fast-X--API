@@ -214,7 +214,14 @@ builder.Services.AddSignalR();
 
 // Bybit "testnet" connections use Bybit Demo Trading when this is on (see BybitEnvironments).
 BybitEnvironments.UseDemoTrading = builder.Configuration.GetValue<bool>("Bybit:UseDemoTrading");
-BinanceEnvironments.UseDemoTrading = builder.Configuration.GetValue<bool>("Binance:UseDemoTrading");
+// A Binance connection that is not Live is a Demo connection, so Demo is the default.
+BinanceEnvironments.UseDemoTrading = builder.Configuration.GetValue<bool>("Binance:UseDemoTrading", true);
+
+// Real-money trading stays OFF until you set Trading__AllowLive=true.
+BrokerService.AllowLiveTrading = builder.Configuration.GetValue<bool>("Trading:AllowLive");
+
+// A bot stops by itself when its stop-loss or take-profit is hit (set Trading__StopBotOnProtectionExit=false to disable).
+BrokerService.StopBotAfterProtectionExit = builder.Configuration.GetValue<bool>("Trading:StopBotOnProtectionExit", true);
 var app = builder.Build();
 
 app.UseForwardedHeaders();

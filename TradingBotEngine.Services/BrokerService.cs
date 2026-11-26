@@ -13,6 +13,14 @@ namespace TradingBotEngine.Services
 {
     public class BrokerService
     {
+        // Server-wide switches, set once at startup from configuration (see Program.cs).
+        // Code defaults keep unit tests unchanged; the application sets AllowLiveTrading from
+        // Trading:AllowLive, which is OFF unless you turn it on.
+        public static bool AllowLiveTrading { get; set; } = true;
+
+        // When a trade is closed by its stop-loss or take-profit, stop the bot that opened it.
+        public static bool StopBotAfterProtectionExit { get; set; } = true;
+
         private readonly ApplicationDbContext _context;
         private readonly ICredentialProtector _protector;
         private readonly ExchangeMarketDataService _marketDataService;
@@ -82,10 +90,25 @@ namespace TradingBotEngine.Services
 
             try
             {
+                // Automatic connect: try the safe Demo environment first. If these keys are not valid there and
+                // live trading is allowed on this server, try Live automatically. Spot and futures use the
+                // same keys, and verification accepts either. Live trading itself stays OFF until the
+                // user explicitly enables it.
                 var client = CreateClient(persisted);
 
                 var connected =
                     await VerifyConnectionWithRetryAsync(client, persisted);
+
+                if (!connected && AllowLiveTrading)
+                {
+                    persisted.IsTestnet = false;
+
+                    var liveClient = CreateClient(persisted);
+                    connected = await VerifyConnectionWithRetryAsync(liveClient, persisted);
+
+                    if (!connected)
+                        persisted.IsTestnet = true;
+                }
 
                 persisted.IsConnected = connected;
                 persisted.IsActive = connected || persisted.IsActive;
@@ -108,7 +131,7 @@ namespace TradingBotEngine.Services
 
                     Details =
                         $"Broker {persisted.BrokerName} connection attempt " +
-                        $"completed in {(persisted.IsTestnet ? "testnet" : "live")} mode.",
+                        $"completed in {(persisted.IsTestnet ? "demo" : "LIVE (trading stays OFF until you enable it)")} mode.",
 
                     CreatedAt = DateTime.UtcNow
                 });
@@ -239,6 +262,21 @@ namespace TradingBotEngine.Services
 
             if (enabled)
             {
+                if (!AllowLiveTrading)
+                {
+                    _context.AuditLogs.Add(new AuditLog
+                    {
+                        UserId = userId,
+                        Action = "LiveTradingEnableBlocked",
+                        Details = "Live trading enable attempt blocked: live trading is switched off on the server (Trading:AllowLive).",
+                        CreatedAt = DateTime.UtcNow
+                    });
+
+                    await _context.SaveChangesAsync();
+
+                    return false;
+                }
+
                 if (!connection.IsConnected)
                 {
                     _context.AuditLogs.Add(new AuditLog
@@ -582,6 +620,15 @@ namespace TradingBotEngine.Services
                     "OrderBlocked_NoBrokerConnection",
                     "No active broker connection.",
                     $"Order for '{symbol}' was blocked because no active broker connection exists.");
+            }
+
+            if (!connection.IsTestnet && !AllowLiveTrading)
+            {
+                return await AuditOrderFailureAsync(
+                    userId,
+                    "OrderBlocked_LiveTradingDisabledOnServer",
+                    "Live trading is switched off on this server (Trading:AllowLive).",
+                    $"Order for '{symbol}' was blocked because live trading is switched off on the server.");
             }
 
             if (!connection.IsTestnet &&
@@ -2208,6 +2255,12 @@ namespace TradingBotEngine.Services
             trade.UpdatedAt = DateTime.UtcNow;
             await _context.SaveChangesAsync();
 
+            if (useFutures)
+            {
+                // Futures SL/TP are algo orders: cancel them all for this symbol before exiting.
+                try { await CreateFuturesAlgoApi(connection).CancelAllOpenAsync(trade.Symbol); } catch { }
+            }
+
             foreach (var protectionOrderId in new[] { trade.StopLossOrderId, trade.TakeProfitOrderId }
                          .Where(id => !string.IsNullOrWhiteSpace(id))
                          .Distinct())
@@ -2663,12 +2716,13 @@ namespace TradingBotEngine.Services
 
                     if (trade.StopLoss.HasValue && string.IsNullOrWhiteSpace(trade.StopLossOrderId))
                     {
-                        var stop = await binance.UsdFuturesApi.Trading.PlaceOrderAsync(
-                            symbol: trade.Symbol, side: protectionSide, type: FuturesOrderType.StopMarket,
-                            quantity: filledQuantity, positionSide: PositionSide.Both, reduceOnly: true,
-                            stopPrice: trade.StopLoss.Value);
+                        var stop = await CreateFuturesAlgoApi(connection).PlaceCloseAllConditionalAsync(
+                            trade.Symbol,
+                            protectionSide == OrderSide.Buy ? "BUY" : "SELL",
+                            "STOP_MARKET",
+                            trade.StopLoss.Value);
 
-                        if (!stop.Success || stop.Data == null)
+                        if (!stop.Success)
                         {
                             trade.ProtectionStatus = "ProtectionPending";
                             trade.Reason = LimitLength($"Binance Futures stop-loss was not accepted: {stop.Error}", 480);
@@ -2677,19 +2731,19 @@ namespace TradingBotEngine.Services
                             return false;
                         }
 
-                        trade.StopLossOrderId = stop.Data.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                        await PersistExchangeOrderAsync(trade.UserId, trade, connection, trade.StopLossOrderId,
-                            protectionSide == OrderSide.Buy ? "BUY" : "SELL", "StopMarket", true, "StopLoss", parent.Id);
+                        // Algo order id (a separate id space from normal orders), used to cancel it later.
+                        trade.StopLossOrderId = stop.AlgoId.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     }
 
                     if (trade.TakeProfit.HasValue && string.IsNullOrWhiteSpace(trade.TakeProfitOrderId))
                     {
-                        var tp = await binance.UsdFuturesApi.Trading.PlaceOrderAsync(
-                            symbol: trade.Symbol, side: protectionSide, type: FuturesOrderType.TakeProfitMarket,
-                            quantity: filledQuantity, positionSide: PositionSide.Both, reduceOnly: true,
-                            stopPrice: trade.TakeProfit.Value);
+                        var tp = await CreateFuturesAlgoApi(connection).PlaceCloseAllConditionalAsync(
+                            trade.Symbol,
+                            protectionSide == OrderSide.Buy ? "BUY" : "SELL",
+                            "TAKE_PROFIT_MARKET",
+                            trade.TakeProfit.Value);
 
-                        if (!tp.Success || tp.Data == null)
+                        if (!tp.Success)
                         {
                             trade.ProtectionStatus = "ProtectionPending";
                             trade.Reason = LimitLength($"Binance Futures take-profit was not accepted: {tp.Error}", 480);
@@ -2698,9 +2752,7 @@ namespace TradingBotEngine.Services
                             return false;
                         }
 
-                        trade.TakeProfitOrderId = tp.Data.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                        await PersistExchangeOrderAsync(trade.UserId, trade, connection, trade.TakeProfitOrderId,
-                            protectionSide == OrderSide.Buy ? "BUY" : "SELL", "TakeProfitMarket", true, "TakeProfit", parent.Id);
+                        trade.TakeProfitOrderId = tp.AlgoId.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     }
 
                     trade.ProtectionStatus = "Protected";
@@ -3082,6 +3134,121 @@ namespace TradingBotEngine.Services
             {
                 return false;
             }
+        }
+
+        private BinanceFuturesAlgoApi CreateFuturesAlgoApi(BrokerConnection connection)
+        {
+            if (string.IsNullOrWhiteSpace(connection.ApiSecret))
+                throw new InvalidOperationException("Broker secret is missing.");
+
+            return new BinanceFuturesAlgoApi(
+                BinanceEnvironments.FuturesRestBaseUrl(connection.IsTestnet),
+                _protector.Unprotect(connection.ApiKey),
+                _protector.Unprotect(connection.ApiSecret));
+        }
+
+        // Binance fills a futures stop-loss / take-profit on its own, and an algo order leaves no regular
+        // order record to reconcile. So: if a protected Binance futures trade no longer has a position,
+        // cancel the leftover leg and book the result from the exchange's own fills.
+        public async Task<int> SyncFuturesAlgoProtectionAsync()
+        {
+            var candidates = await _context.Trades
+                .Where(t =>
+                    t.Status == "Open" &&
+                    t.BrokerName == "Binance" &&
+                    t.ProtectionStatus == "Protected" &&
+                    (t.StopLossOrderId != null || t.TakeProfitOrderId != null) &&
+                    _context.ExchangeOrders.Any(o => o.TradeId == t.Id && o.OrderRole == "Entry" && o.IsFutures))
+                .ToListAsync();
+
+            var closedCount = 0;
+
+            foreach (var trade in candidates)
+            {
+                try
+                {
+                    var connection = await _context.BrokerConnections.FirstOrDefaultAsync(c =>
+                        c.UserId == trade.UserId && c.BrokerName == trade.BrokerName && c.IsConnected);
+
+                    if (connection == null || CreateClient(connection) is not BinanceRestClient binance)
+                        continue;
+
+                    var positions = await binance.UsdFuturesApi.Account.GetPositionInformationAsync(trade.Symbol);
+                    if (!positions.Success || positions.Data == null)
+                        continue;
+
+                    var stillOpen = positions.Data.Any(p =>
+                        string.Equals(p.Symbol, trade.Symbol, StringComparison.OrdinalIgnoreCase) &&
+                        Math.Abs(p.Quantity) > 0m);
+
+                    if (stillOpen)
+                        continue;
+
+                    try { await CreateFuturesAlgoApi(connection).CancelAllOpenAsync(trade.Symbol); } catch { }
+
+                    var entryIsBuy = string.Equals(trade.Direction, "BUY", StringComparison.OrdinalIgnoreCase);
+                    var oldest = DateTime.UtcNow.AddDays(-6);
+                    var since = trade.EntryTime > oldest ? trade.EntryTime.AddMinutes(-1) : oldest;
+
+                    decimal? exitPrice = null;
+                    decimal? profitLoss = null;
+                    var exitTime = DateTime.UtcNow;
+
+                    var fills = await binance.UsdFuturesApi.Trading.GetUserTradesAsync(trade.Symbol, since, null, 100);
+                    if (fills.Success && fills.Data != null)
+                    {
+                        var closing = fills.Data
+                            .Where(f => entryIsBuy ? f.Side == OrderSide.Sell : f.Side == OrderSide.Buy)
+                            .ToList();
+
+                        if (closing.Count > 0)
+                        {
+                            var quantity = closing.Sum(f => f.Quantity);
+                            if (quantity > 0m)
+                                exitPrice = closing.Sum(f => f.Price * f.Quantity) / quantity;
+
+                            profitLoss = closing.Sum(f => f.RealizedPnl);
+                            exitTime = closing.Max(f => f.Timestamp);
+                        }
+                    }
+
+                    var notional = trade.EntryPrice * trade.Quantity;
+
+                    trade.Status = "Closed";
+                    // Which leg fired? The one the exit price is closest to; if the price is unknown, the sign of the P&L.
+                    bool tookProfit;
+                    if (exitPrice.HasValue && trade.TakeProfit.HasValue && trade.StopLoss.HasValue)
+                        tookProfit = Math.Abs(exitPrice.Value - trade.TakeProfit.Value) < Math.Abs(exitPrice.Value - trade.StopLoss.Value);
+                    else
+                        tookProfit = profitLoss.HasValue && profitLoss.Value > 0m;
+
+                    trade.ProtectionStatus = "Triggered";
+                    trade.ExitPrice = exitPrice;
+                    trade.ExitTime = exitTime;
+                    trade.ProfitLoss = profitLoss;
+                    trade.ProfitLossPercentage =
+                        profitLoss.HasValue && notional > 0m ? profitLoss.Value / notional * 100m : null;
+                    trade.Reason = tookProfit ? "Take-profit protection triggered." : "Stop-loss protection triggered.";
+                    trade.UpdatedAt = DateTime.UtcNow;
+
+                    _context.AuditLogs.Add(new AuditLog
+                    {
+                        UserId = trade.UserId,
+                        Action = "FuturesProtectionTriggered",
+                        Details = $"Trade {trade.Id} ({trade.Symbol}) closed by its exchange stop-loss/take-profit. Exit {exitPrice?.ToString("0.####") ?? "unknown"}, P&L {profitLoss?.ToString("0.####") ?? "unknown"} (gross of fees).",
+                        CreatedAt = DateTime.UtcNow
+                    });
+
+                    await _context.SaveChangesAsync();
+                    closedCount++;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[FuturesSync] Trade {trade.Id}: {ex.Message}");
+                }
+            }
+
+            return closedCount;
         }
 
         // The protection (stop-loss + take-profit OCO) can already exist on Binance even though the app
@@ -3911,13 +4078,18 @@ namespace TradingBotEngine.Services
                         .Account
                         .GetAccountInfoAsync();
 
-                if (!result.Success)
-                {
-                    Console.Error.WriteLine(
-                        $"[BrokerVerify] Binance verification failed (testnet={connection.IsTestnet}, UseDemoTrading={BinanceEnvironments.UseDemoTrading}): {result.Error}");
-                }
+                if (result.Success)
+                    return true;
 
-                return result.Success;
+                // Keys that only have futures permission still count as connected.
+                var futuresResult = await binance.UsdFuturesApi.Account.GetBalancesAsync();
+                if (futuresResult.Success)
+                    return true;
+
+                Console.Error.WriteLine(
+                    $"[BrokerVerify] Binance verification failed (demo/testnet={connection.IsTestnet}, UseDemoTrading={BinanceEnvironments.UseDemoTrading}): spot: {result.Error}; futures: {futuresResult.Error}");
+
+                return false;
             }
 
             if (client is BybitRestClient bybit)
